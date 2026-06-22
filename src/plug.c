@@ -15,6 +15,7 @@
 #include "thirdparty/nob.h"
 #include "thirdparty/tinyfiledialogs.h"
 
+#include <pthread.h>
 #include <raylib.h>
 #include <rlgl.h>
 
@@ -70,7 +71,7 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 #define GLSL_VERSION 330
 
 #define FFT_SIZE (1<<13)
-#define FONT_SIZE 64
+#define FONT_SIZE 48
 
 #define PREVIEW_FPS 60
 
@@ -90,6 +91,7 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 #define COLOR_HUD_BUTTON_BACKGROUND   COLOR_TRACK_BUTTON_BACKGROUND
 #define COLOR_HUD_BUTTON_HOVEROVER    COLOR_TRACK_BUTTON_HOVEROVER
 #define COLOR_POPUP_BACKGROUND        ColorFromHSV(0, 0.75, 0.8)
+#define COLOR_POPUP_SUCCESS           ColorFromHSV(120, 0.75, 0.8)
 #define COLOR_TOOLTIP_BACKGROUND      COLOR_TRACK_PANEL_BACKGROUND
 #define COLOR_TOOLTIP_FOREGROUND      WHITE
 #define HUD_TIMER_SECS 1.0f
@@ -103,6 +105,8 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 
 #define KEY_TOGGLE_PLAY KEY_SPACE
 #define KEY_RENDER      KEY_R
+#define IS_KEY_DOWN_MOD(mod) (IsKeyDown(KEY_LEFT_##mod) || IsKeyDown(KEY_RIGHT_##mod))
+#define IS_CTRL_DOWN     IS_KEY_DOWN_MOD(CONTROL)
 #define KEY_FULLSCREEN  KEY_F
 #define KEY_CAPTURE     KEY_C
 #define KEY_TOGGLE_MUTE KEY_M
@@ -130,7 +134,21 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 typedef struct {
     char *file_path;
     Music music;
+    Texture2D cover;
+    bool has_cover;
 } Track;
+
+typedef enum {
+    REPEAT_NONE,
+    REPEAT_ALL,
+} Repeat_Mode;
+
+typedef enum {
+    VIZ_BARS,
+    VIZ_CIRCULAR,
+    VIZ_WAVEFORM,
+    COUNT_VIZ_MODES,
+} Viz_Mode;
 
 typedef struct {
     Track *items;
@@ -140,6 +158,8 @@ typedef struct {
 
 typedef struct {
     float lifetime;
+    char message[64];
+    bool success;
 } Popup;
 
 #define PT_GET(pt, index) (assert(index < (pt)->count), &(pt)->items[((pt)->begin + index)%POPUP_TRAY_CAPACITY])
@@ -187,6 +207,8 @@ typedef struct {
     // Visualizer
     Tracks tracks;
     int current_track;
+    Repeat_Mode repeat_mode;
+    bool shuffle;
     Font font;
     Shader circle;
     int circle_radius_location;
@@ -202,6 +224,11 @@ typedef struct {
     FFMPEG *ffmpeg;
     bool cancel_rendering;
 
+    // Waveform Preview
+    int prev_track_index;
+    Wave preview_wave;
+    float *preview_wave_samples;
+
     // FFT Analyzer
     float in_raw[FFT_SIZE];
     float in_win[FFT_SIZE];
@@ -213,6 +240,44 @@ typedef struct {
     //   Extracted from https://github.com/tsoding/musializer/pull/11
 
     uint64_t active_button_id;
+
+    // Equalizer
+    float eq_low;
+    float eq_mid;
+    float eq_high;
+    bool eq_low_drag;
+    bool eq_mid_drag;
+    bool eq_high_drag;
+
+    // Audio EQ (1-pole filter states for 3-band splitter)
+    float eq_low_lp[2];
+    float eq_high_lp[2];
+
+    // Crossfade
+    bool crossfading;
+    float crossfade_timer;
+    float crossfade_duration;
+    Music crossfade_music;
+
+    // Playback tracking
+    bool track_was_playing;
+
+    // Beat Detection
+    float beat_energy_history[43];
+    size_t beat_history_index;
+    float beat_intensity;
+    bool beat_detected;
+
+    // Visualization
+    Viz_Mode viz_mode;
+    float repeat_mode_label_timer;
+
+    // Now-playing banner
+    int now_playing_track;
+    float now_playing_timer;
+
+    // Keyboard shortcut overlay
+    bool show_help;
 
     Popup_Tray pt;
 
@@ -324,6 +389,21 @@ static size_t fft_analyze(float dt)
         p->out_log[i] /= max_amp;
     }
 
+    // Apply EQ gains
+    {
+        size_t low_end = m / 6;
+        if (low_end < 1) low_end = 1;
+        size_t mid_end = m / 2;
+        if (mid_end <= low_end) mid_end = low_end + 1;
+        for (size_t i = 0; i < m; ++i) {
+            float gain;
+            if (i < low_end) gain = p->eq_low * 2.0f;
+            else if (i < mid_end) gain = p->eq_mid * 2.0f;
+            else gain = p->eq_high * 2.0f;
+            p->out_log[i] *= gain;
+        }
+    }
+
     // Smooth out and smear the values
     for (size_t i = 0; i < m; ++i) {
         float smoothness = 8;
@@ -332,11 +412,126 @@ static size_t fft_analyze(float dt)
         p->out_smear[i] += (p->out_smooth[i] - p->out_smear[i])*smearness*dt;
     }
 
+    // Beat Detection
+    {
+        float avg_energy = 0;
+        for (size_t i = 0; i < m; i++) {
+            avg_energy += p->out_log[i];
+        }
+        avg_energy /= m;
+
+        size_t beat_hist_len = sizeof(p->beat_energy_history)/sizeof(p->beat_energy_history[0]);
+        p->beat_energy_history[p->beat_history_index % beat_hist_len] = avg_energy;
+        p->beat_history_index++;
+
+        if (p->beat_history_index > beat_hist_len) {
+            float sum = 0;
+            for (size_t i = 0; i < beat_hist_len; i++) {
+                sum += p->beat_energy_history[i];
+            }
+            float avg = sum / beat_hist_len;
+            p->beat_detected = avg_energy > avg * 1.5f;
+        } else {
+            p->beat_detected = false;
+        }
+
+        float beat_decay = 8.0f;
+        p->beat_intensity += (0.0f - p->beat_intensity) * beat_decay * dt;
+        if (p->beat_detected) p->beat_intensity = 1.0f;
+    }
+
     return m;
+}
+
+static const char *viz_mode_name(Viz_Mode mode)
+{
+    switch (mode) {
+        case VIZ_BARS:     return "Bars";
+        case VIZ_CIRCULAR: return "Circular";
+        case VIZ_WAVEFORM: return "Waveform";
+        default:           return "";
+    }
+}
+
+static const char *repeat_mode_name(Repeat_Mode mode)
+{
+    switch (mode) {
+        case REPEAT_NONE: return "Repeat: Off";
+        case REPEAT_ALL:  return "Repeat: All";
+        default:          return "";
+    }
+}
+
+static void fft_render_circular(Rectangle boundary, size_t m)
+{
+    float cx = boundary.x + boundary.width / 2;
+    float cy = boundary.y + boundary.height / 2;
+    float max_radius = (boundary.width < boundary.height ? boundary.width : boundary.height) * 0.4f;
+    float saturation = 0.75f;
+    float value = 1.0f;
+
+    float angle_step = 2.0f * PI / m;
+    for (size_t i = 0; i < m; ++i) {
+        float t = p->out_smooth[i];
+        float hue = (float)i / m * 360;
+        Color color = ColorFromHSV(hue, saturation, value);
+        float r = max_radius * (0.3f + 0.7f * t);
+        float a = angle_step * i - PI / 2;
+        float px = cx + cosf(a) * r;
+        float py = cy + sinf(a) * r;
+        DrawCircleV((Vector2){px, py}, max_radius * 0.03f + max_radius * 0.05f * t, color);
+        DrawLineEx((Vector2){cx, cy}, (Vector2){px, py}, max_radius * 0.02f * t, ColorAlpha(color, 0.3f));
+    }
+}
+
+static void fft_render_waveform(Rectangle boundary, size_t m)
+{
+    float mid_y = boundary.y + boundary.height / 2;
+    float saturation = 0.75f;
+    float value = 1.0f;
+    float amp = boundary.height * 0.4f;
+
+    for (size_t i = 0; i + 1 < m; ++i) {
+        float t0 = p->out_smooth[i];
+        float t1 = p->out_smooth[i + 1];
+        float hue = (float)i / m * 360;
+        Color color = ColorFromHSV(hue, saturation, value);
+        float x0 = boundary.x + (float)i / (m - 1) * boundary.width;
+        float x1 = boundary.x + (float)(i + 1) / (m - 1) * boundary.width;
+        float y0 = mid_y - t0 * amp;
+        float y1 = mid_y - t1 * amp;
+        DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, boundary.height * 0.02f, color);
+    }
+
+    // Mirror below
+    for (size_t i = 0; i + 1 < m; ++i) {
+        float t0 = p->out_smooth[i];
+        float t1 = p->out_smooth[i + 1];
+        float hue = (float)i / m * 360;
+        Color color = ColorFromHSV(hue, saturation, value * 0.5f);
+        float x0 = boundary.x + (float)i / (m - 1) * boundary.width;
+        float x1 = boundary.x + (float)(i + 1) / (m - 1) * boundary.width;
+        float y0 = mid_y + t0 * amp * 0.5f;
+        float y1 = mid_y + t1 * amp * 0.5f;
+        DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, boundary.height * 0.01f, ColorAlpha(color, 0.3f));
+    }
 }
 
 static void fft_render(Rectangle boundary, size_t m)
 {
+    if (m == 0) return;
+
+    switch (p->viz_mode) {
+        case VIZ_CIRCULAR:
+            fft_render_circular(boundary, m);
+            goto beat_flash;
+        case VIZ_WAVEFORM:
+            fft_render_waveform(boundary, m);
+            goto beat_flash;
+        default:
+            break;
+    }
+
     // The width of a single bar
     float cell_width = boundary.width/m;
 
@@ -424,6 +619,38 @@ static void fft_render(Rectangle boundary, size_t m)
         DrawTextureEx(texture, position, 0, 2*radius, color);
     }
     EndShaderMode();
+
+    // Beat flash overlay
+beat_flash:
+    if (p->beat_intensity > 0.01f) {
+        DrawRectangleRec(boundary, ColorAlpha(WHITE, p->beat_intensity * 0.15f));
+    }
+
+    // Viz mode label (top-right corner)
+    {
+        float t = GetTime();
+        static float mode_switch_time = 0;
+        if (IsKeyPressed(KEY_V)) mode_switch_time = t;
+        if (t - mode_switch_time < 1.5f) {
+            const char *name = viz_mode_name(p->viz_mode);
+            float fs = 24;
+            Vector2 sz = MeasureTextEx(p->font, name, fs, 0);
+            Vector2 pos = { boundary.x + boundary.width - sz.x - 20, boundary.y + 10 };
+            DrawRectangleRec((Rectangle){pos.x - 5, pos.y - 5, sz.x + 10, sz.y + 10}, ColorAlpha(COLOR_BACKGROUND, 0.7f));
+            DrawTextEx(p->font, name, pos, fs, 0, WHITE);
+        }
+    }
+
+    // Repeat mode label (below viz mode label)
+    if (p->repeat_mode_label_timer > 0) {
+        p->repeat_mode_label_timer -= GetFrameTime();
+        const char *name = repeat_mode_name(p->repeat_mode);
+        float fs = 20;
+        Vector2 sz = MeasureTextEx(p->font, name, fs, 0);
+        Vector2 pos = { boundary.x + boundary.width - sz.x - 20, boundary.y + 10 + 30 };
+        DrawRectangleRec((Rectangle){pos.x - 5, pos.y - 5, sz.x + 10, sz.y + 10}, ColorAlpha(COLOR_BACKGROUND, 0.7f));
+        DrawTextEx(p->font, name, pos, fs, 0, ColorAlpha(WHITE, 0.8f));
+    }
 }
 
 static void fft_push(float frame)
@@ -432,11 +659,43 @@ static void fft_push(float frame)
     p->in_raw[FFT_SIZE-1] = frame;
 }
 
+#define EQ_LOW_FC 300.0f
+#define EQ_HIGH_FC 8000.0f
+#define EQ_SAMPLE_RATE 44100.0f
+
+static void apply_audio_eq(float (*buffer)[2], unsigned int frames)
+{
+    float alpha_low = 1.0f - expf(-2.0f * PI * EQ_LOW_FC / EQ_SAMPLE_RATE);
+    float alpha_high = 1.0f - expf(-2.0f * PI * EQ_HIGH_FC / EQ_SAMPLE_RATE);
+
+    for (unsigned int i = 0; i < frames; ++i) {
+        for (int ch = 0; ch < 2; ++ch) {
+            float input = buffer[i][ch];
+            float gain_low = p->eq_low * 2.0f;
+            float gain_mid = p->eq_mid * 2.0f;
+            float gain_high = p->eq_high * 2.0f;
+
+            p->eq_low_lp[ch] += alpha_low * (input - p->eq_low_lp[ch]);
+            float low = p->eq_low_lp[ch];
+
+            p->eq_high_lp[ch] += alpha_high * (input - p->eq_high_lp[ch]);
+            float low_mid = p->eq_high_lp[ch];
+
+            float mid = low_mid - low;
+            float high = input - low_mid;
+
+            buffer[i][ch] = low * gain_low + mid * gain_mid + high * gain_high;
+        }
+    }
+}
+
 // TODO: make sure the audio callback is thread-safe
 static void callback(void *bufferData, unsigned int frames)
 {
     // https://cdecl.org/?q=float+%28*fs%29%5B2%5D
     float (*fs)[2] = bufferData;
+
+    apply_audio_eq(fs, frames);
 
     for (size_t i = 0; i < frames; ++i) {
         fft_push(fs[i][0]);
@@ -469,7 +728,7 @@ static Track *current_track(void)
 }
 
 
-static void popup_tray_push(Popup_Tray *pt)
+static void popup_tray_push(Popup_Tray *pt, const char *message, bool success)
 {
     if (pt->count < POPUP_TRAY_CAPACITY) {
         if (pt->begin == 0) {
@@ -481,6 +740,9 @@ static void popup_tray_push(Popup_Tray *pt)
 
         pt->slide += HUD_POPUP_SLIDEIN_SECS;
         PT_FIRST(pt)->lifetime = HUD_POPUP_LIFETIME_SECS + pt->slide;
+        PT_FIRST(pt)->success = success;
+        strncpy(PT_FIRST(pt)->message, message, sizeof(PT_FIRST(pt)->message) - 1);
+        PT_FIRST(pt)->message[sizeof(PT_FIRST(pt)->message) - 1] = '\0';
     }
 }
 
@@ -603,9 +865,517 @@ static void tooltip(Rectangle boundary, const char *text, Side align, bool persi
     p->tooltip_element_boundary = boundary;
 }
 
+static void unload_preview_waveform(void)
+{
+    if (p->preview_wave_samples) {
+        UnloadWaveSamples(p->preview_wave_samples);
+        p->preview_wave_samples = NULL;
+    }
+    if (p->preview_wave.frameCount > 0) {
+        UnloadWave(p->preview_wave);
+        memset(&p->preview_wave, 0, sizeof(p->preview_wave));
+    }
+    p->prev_track_index = -1;
+}
+
+static void load_preview_waveform(const char *file_path)
+{
+    unload_preview_waveform();
+    p->preview_wave = LoadWave(file_path);
+
+    if (p->preview_wave.frameCount == 0) {
+        // FFmpeg fallback for unsupported formats
+        char wav_path[1024];
+        {
+            const char *tmp_dir = "/tmp";
+#if defined(_WIN32)
+            tmp_dir = getenv("TEMP");
+            if (!tmp_dir) tmp_dir = ".";
+#endif
+            char tmp_path[1024];
+            snprintf(tmp_path, sizeof(tmp_path), "%s/musializer_XXXXXX", tmp_dir);
+            int fd = mkstemp(tmp_path);
+            if (fd != -1) {
+                close(fd);
+                snprintf(wav_path, sizeof(wav_path), "%s.wav", tmp_path);
+                remove(wav_path);
+                rename(tmp_path, wav_path);
+            }
+        }
+        if (wav_path[0]) {
+            // Show loading indicator before blocking FFmpeg call
+            {
+                const char *msg = "Loading waveform...";
+                int fw = MeasureText(msg, 20);
+                DrawRectangle(0, GetScreenHeight()/2 - 15, GetScreenWidth(), 30, ColorAlpha(COLOR_BACKGROUND, 0.9f));
+                DrawText(msg, GetScreenWidth()/2 - fw/2, GetScreenHeight()/2 - 10, 20, WHITE);
+                EndDrawing();
+                BeginDrawing();
+                ClearBackground(COLOR_BACKGROUND);
+            }
+            char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -f wav \"%s\" 2>/dev/null", file_path, wav_path);
+            if (system(cmd) == 0) {
+                Wave wave = LoadWave(wav_path);
+                if (wave.frameCount > 0) {
+                    p->preview_wave = wave;
+                    p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
+                }
+            }
+            remove(wav_path);
+        }
+    } else {
+        p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
+    }
+}
+
+static void play_track(int index)
+{
+    if (index < 0 || (size_t)index >= p->tracks.count) return;
+    Track *old = current_track();
+    if (old && old != &p->tracks.items[index]) {
+        p->crossfade_music = old->music;
+        p->crossfading = true;
+        p->crossfade_timer = 0.0f;
+    }
+    SeekMusicStream(p->tracks.items[index].music, 0);
+    PlayMusicStream(p->tracks.items[index].music);
+    if (old && old != &p->tracks.items[index]) {
+        SetMusicVolume(p->tracks.items[index].music, 0.0f);
+    } else {
+        SetMusicVolume(p->tracks.items[index].music, GetMasterVolume());
+    }
+    p->current_track = index;
+    p->now_playing_track = index;
+    p->now_playing_timer = 2.5f;
+    fft_clean();
+    {
+        char title[2048];
+        snprintf(title, sizeof(title), "Musializer - %s", GetFileName(p->tracks.items[index].file_path));
+        SetWindowTitle(title);
+    }
+}
+
+static void next_track(void)
+{
+    if (p->tracks.count == 0) return;
+    if (p->shuffle && p->tracks.count > 1) {
+        int next;
+        do {
+            next = rand() % (int)p->tracks.count;
+        } while (next == p->current_track);
+        play_track(next);
+    } else {
+        int next = p->current_track + 1;
+        if (next >= (int)p->tracks.count) {
+            if (p->repeat_mode == REPEAT_ALL) next = 0;
+            else return;
+        }
+        play_track(next);
+    }
+}
+
+static void prev_track(void)
+{
+    if (p->tracks.count == 0) return;
+    int prev = p->current_track - 1;
+    if (prev < 0) {
+        if (p->repeat_mode == REPEAT_ALL) prev = (int)p->tracks.count - 1;
+        else prev = 0;
+    }
+    play_track(prev);
+}
+
+static bool is_audio_extension(const char *ext)
+{
+    if (!ext || ext[0] != '.') return false;
+    const char *e = ext + 1;
+    // raylib native
+    if ((e[0] == 'w' || e[0] == 'W') && (e[1] == 'a' || e[1] == 'A') && (e[2] == 'v' || e[2] == 'V') && !e[3]) return true;
+    if ((e[0] == 'o' || e[0] == 'O') && (e[1] == 'g' || e[1] == 'G') && (e[2] == 'g' || e[2] == 'G') && !e[3]) return true;
+    if ((e[0] == 'm' || e[0] == 'M') && (e[1] == 'p' || e[1] == 'P') && (e[2] == '3') && !e[3]) return true;
+    if ((e[0] == 'f' || e[0] == 'F') && (e[1] == 'l' || e[1] == 'L') && (e[2] == 'a' || e[2] == 'A') && (e[3] == 'c' || e[3] == 'C') && !e[4]) return true;
+    if ((e[0] == 'q' || e[0] == 'Q') && (e[1] == 'o' || e[1] == 'O') && (e[2] == 'a' || e[2] == 'A') && !e[3]) return true;
+    if ((e[0] == 'x' || e[0] == 'X') && (e[1] == 'm' || e[1] == 'M') && !e[2]) return true;
+    if ((e[0] == 'm' || e[0] == 'M') && (e[1] == 'o' || e[1] == 'O') && (e[2] == 'd' || e[2] == 'D') && !e[3]) return true;
+    // FFmpeg fallback
+    if ((e[0] == 'm' || e[0] == 'M') && (e[1] == '4' || e[1] == '4') && (e[2] == 'a' || e[2] == 'A') && !e[3]) return true;
+    if ((e[0] == 'a' || e[0] == 'A') && (e[1] == 'a' || e[1] == 'A') && (e[2] == 'c' || e[2] == 'C') && !e[3]) return true;
+    if ((e[0] == 'w' || e[0] == 'W') && (e[1] == 'm' || e[1] == 'M') && (e[2] == 'a' || e[2] == 'A') && !e[3]) return true;
+    if ((e[0] == 'a' || e[0] == 'A') && (e[1] == 'i' || e[1] == 'I') && (e[2] == 'f' || e[2] == 'F') && (e[3] == 'f' || e[3] == 'F') && !e[4]) return true;
+    if ((e[0] == 'a' || e[0] == 'A') && (e[1] == 'p' || e[1] == 'P') && (e[2] == 'e' || e[2] == 'E') && !e[3]) return true;
+    if ((e[0] == 'o' || e[0] == 'O') && (e[1] == 'p' || e[1] == 'P') && (e[2] == 'u' || e[2] == 'U') && (e[3] == 's' || e[3] == 'S') && !e[4]) return true;
+    return false;
+}
+
+// ----------------------------------------------------------------------------
+// Threaded loader for FFmpeg-based audio conversion and cover extraction
+// ----------------------------------------------------------------------------
+typedef struct {
+    char source_path[4096];
+    char wav_path[4096];
+    char cover_path[4096];
+    bool has_cover;
+    bool failed;
+    int target_track; // -1 = create new track, >=0 = apply cover to existing track
+    bool need_conversion;
+    bool need_cover;
+} Load_Job;
+
+static struct {
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    bool running;
+    Load_Job *pending;
+    size_t pending_count;
+    size_t pending_cap;
+    Load_Job *completed;
+    size_t completed_count;
+    size_t completed_cap;
+    size_t loading;
+} loader = {0};
+
+static void *loader_thread(void *arg)
+{
+    (void)arg;
+    while (1) {
+        Load_Job job;
+        pthread_mutex_lock(&loader.mutex);
+        while (loader.pending_count == 0) {
+            if (!loader.running) {
+                pthread_mutex_unlock(&loader.mutex);
+                return NULL;
+            }
+            pthread_cond_wait(&loader.cond, &loader.mutex);
+        }
+        job = loader.pending[0];
+        memmove(loader.pending, loader.pending + 1, (loader.pending_count - 1) * sizeof(Load_Job));
+        loader.pending_count--;
+        pthread_mutex_unlock(&loader.mutex);
+
+        // Process: FFmpeg conversion
+        if (job.need_conversion) {
+            char tmp_path[1024];
+            snprintf(tmp_path, sizeof(tmp_path), "/tmp/musializer_XXXXXX");
+            int fd = mkstemp(tmp_path);
+            if (fd == -1) { job.failed = true; goto done; }
+            close(fd);
+            snprintf(job.wav_path, sizeof(job.wav_path), "%s.wav", tmp_path);
+            remove(job.wav_path);
+            rename(tmp_path, job.wav_path);
+
+            char cmd[4096];
+            snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -f wav \"%s\" 2>/dev/null", job.source_path, job.wav_path);
+            if (system(cmd) != 0) {
+                remove(job.wav_path);
+                job.wav_path[0] = '\0';
+                job.failed = true;
+                goto done;
+            }
+        }
+
+        // Process: cover extraction
+        if (job.need_cover && !job.failed) {
+            char tmp_cov[1024];
+            snprintf(tmp_cov, sizeof(tmp_cov), "/tmp/musializer_cover_XXXXXX");
+            int fd = mkstemp(tmp_cov);
+            if (fd != -1) {
+                close(fd);
+                snprintf(job.cover_path, sizeof(job.cover_path), "%s.jpg", tmp_cov);
+                remove(job.cover_path);
+                rename(tmp_cov, job.cover_path);
+
+                char cmd[4096];
+                snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -an -frames:v 1 \"%s\" 2>/dev/null", job.source_path, job.cover_path);
+                if (system(cmd) == 0) {
+                    job.has_cover = true;
+                } else {
+                    remove(job.cover_path);
+                    job.cover_path[0] = '\0';
+                }
+            }
+        }
+
+    done:
+        pthread_mutex_lock(&loader.mutex);
+        if (loader.completed_count >= loader.completed_cap) {
+            loader.completed_cap = loader.completed_cap ? loader.completed_cap * 2 : 8;
+            loader.completed = realloc(loader.completed, loader.completed_cap * sizeof(Load_Job));
+            assert(loader.completed != NULL);
+        }
+        loader.completed[loader.completed_count++] = job;
+        pthread_mutex_unlock(&loader.mutex);
+    }
+}
+
+static void loader_init(void)
+{
+    pthread_mutex_init(&loader.mutex, NULL);
+    pthread_cond_init(&loader.cond, NULL);
+    loader.running = true;
+    pthread_create(&loader.thread, NULL, loader_thread, NULL);
+}
+
+static void enqueue_load_job(const char *file_path, bool need_conversion)
+{
+    if (!loader.running) loader_init();
+
+    Load_Job job = {0};
+    strncpy(job.source_path, file_path, sizeof(job.source_path) - 1);
+    job.need_conversion = need_conversion;
+    job.need_cover = true;
+    job.target_track = -1;
+
+    pthread_mutex_lock(&loader.mutex);
+    if (loader.pending_count >= loader.pending_cap) {
+        loader.pending_cap = loader.pending_cap ? loader.pending_cap * 2 : 8;
+        loader.pending = realloc(loader.pending, loader.pending_cap * sizeof(Load_Job));
+        assert(loader.pending != NULL);
+    }
+    loader.pending[loader.pending_count++] = job;
+    loader.loading++;
+    pthread_mutex_unlock(&loader.mutex);
+    pthread_cond_signal(&loader.cond);
+}
+
+static void enqueue_cover_job(const char *file_path, int track_index)
+{
+    if (!loader.running) loader_init();
+
+    Load_Job job = {0};
+    strncpy(job.source_path, file_path, sizeof(job.source_path) - 1);
+    job.need_conversion = false;
+    job.need_cover = true;
+    job.target_track = track_index;
+
+    pthread_mutex_lock(&loader.mutex);
+    if (loader.pending_count >= loader.pending_cap) {
+        loader.pending_cap = loader.pending_cap ? loader.pending_cap * 2 : 8;
+        loader.pending = realloc(loader.pending, loader.pending_cap * sizeof(Load_Job));
+        assert(loader.pending != NULL);
+    }
+    loader.pending[loader.pending_count++] = job;
+    loader.loading++;
+    pthread_mutex_unlock(&loader.mutex);
+    pthread_cond_signal(&loader.cond);
+}
+
+static void process_completed_loads(void)
+{
+    if (loader.completed_count == 0) return;
+
+    pthread_mutex_lock(&loader.mutex);
+    size_t n = loader.completed_count;
+    for (size_t i = 0; i < n; i++) {
+        Load_Job *job = &loader.completed[i];
+        if (job->target_track >= 0) {
+            // Cover-only job: apply cover to existing track
+            if (!job->failed && job->has_cover && (size_t)job->target_track < p->tracks.count) {
+                Image img = LoadImage(job->cover_path);
+                if (img.data != NULL) {
+                    p->tracks.items[job->target_track].cover = LoadTextureFromImage(img);
+                    p->tracks.items[job->target_track].has_cover = true;
+                    UnloadImage(img);
+                }
+            }
+            if (job->cover_path[0]) remove(job->cover_path);
+        } else if (!job->failed) {
+            // Full job: create new track
+            Music music = {0};
+            if (job->wav_path[0]) {
+                music = LoadMusicStream(job->wav_path);
+            }
+            if (IsMusicValid(music)) {
+                music.looping = false;
+                AttachAudioStreamProcessor(music.stream, callback);
+                char *path = strdup(job->source_path);
+                assert(path != NULL);
+                Track track = { .file_path = path, .music = music, .has_cover = false };
+                nob_da_append(&p->tracks, track);
+                if (job->has_cover && job->cover_path[0]) {
+                    Image img = LoadImage(job->cover_path);
+                    if (img.data != NULL) {
+                        p->tracks.items[p->tracks.count - 1].cover = LoadTextureFromImage(img);
+                        p->tracks.items[p->tracks.count - 1].has_cover = true;
+                        UnloadImage(img);
+                    }
+                }
+                // Auto-play first track if nothing is playing
+                if (current_track() == NULL) {
+                    play_track((int)(p->tracks.count - 1));
+                }
+                popup_tray_push(&p->pt, "Track loaded", true);
+            } else {
+                popup_tray_push(&p->pt, "Could not load track", false);
+            }
+            if (job->wav_path[0]) remove(job->wav_path);
+            if (job->cover_path[0]) remove(job->cover_path);
+        } else {
+            popup_tray_push(&p->pt, "Failed to convert file", false);
+        }
+        loader.loading--;
+    }
+    loader.completed_count = 0;
+    pthread_mutex_unlock(&loader.mutex);
+}
+
+static void loader_stop(void)
+{
+    if (!loader.running) return;
+    pthread_mutex_lock(&loader.mutex);
+    loader.running = false;
+    pthread_cond_broadcast(&loader.cond);
+    pthread_mutex_unlock(&loader.mutex);
+    pthread_join(loader.thread, NULL);
+    free(loader.pending);
+    free(loader.completed);
+    loader.pending = NULL;
+    loader.completed = NULL;
+    loader.pending_count = loader.pending_cap = 0;
+    loader.completed_count = loader.completed_cap = 0;
+    pthread_mutex_destroy(&loader.mutex);
+    pthread_cond_destroy(&loader.cond);
+}
+// ----------------------------------------------------------------------------
+
+static void load_track_from_path(const char *file_path)
+{
+    if (!is_audio_extension(GetFileExtension(file_path))) {
+        popup_tray_push(&p->pt, "Unsupported file format", false);
+        return;
+    }
+
+    // Try native raylib load first (fast, on main thread)
+    Music music = LoadMusicStream(file_path);
+    if (IsMusicValid(music)) {
+        music.looping = false;
+        AttachAudioStreamProcessor(music.stream, callback);
+        char *path = strdup(file_path);
+        assert(path != NULL);
+        nob_da_append(&p->tracks, (CLITERAL(Track){
+            .file_path = path,
+            .music = music,
+            .has_cover = false,
+        }));
+        // Extract cover art in background thread
+        enqueue_cover_job(file_path, (int)(p->tracks.count - 1));
+        return;
+    }
+
+    // Need FFmpeg conversion — enqueue to background thread
+    enqueue_load_job(file_path, true);
+}
+
+static void load_m3u_playlist(const char *file_path)
+{
+    FILE *f = fopen(file_path, "r");
+    if (!f) {
+        popup_tray_push(&p->pt, "Could not open playlist", false);
+        return;
+    }
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0 || line[0] == '#') continue;
+        load_track_from_path(line);
+    }
+    fclose(f);
+
+    if (current_track() == NULL && p->tracks.count > 0) {
+        p->current_track = 0;
+        PlayMusicStream(p->tracks.items[0].music);
+    }
+}
+
+static void startup_autoplay(void)
+{
+    if (current_track() == NULL && p->tracks.count > 0) {
+        play_track(0);
+    }
+}
+
+static void open_files_dialog(void)
+{
+    char const *filter_patterns[] = {"*.wav", "*.ogg", "*.mp3", "*.qoa", "*.xm", "*.mod", "*.flac", "*.m4a", "*.aac", "*.wma", "*.aiff", "*.ape", "*.opus", "*.m3u", "*.m3u8"};
+    char *result = tinyfd_openFileDialog(
+        "Select music files",
+        "./",
+        NOB_ARRAY_LEN(filter_patterns),
+        filter_patterns,
+        "audio files",
+        1);
+    if (!result) return;
+    char *save = result;
+    while (*result) {
+        char *next = strchr(result, '|');
+        if (next) *next = '\0';
+        const char *ext = GetFileExtension(result);
+        if (ext && (strcmp(ext, ".m3u") == 0 || strcmp(ext, ".m3u8") == 0)) {
+            load_m3u_playlist(result);
+        } else {
+            load_track_from_path(result);
+        }
+        if (!next) break;
+        result = next + 1;
+    }
+    free(save);
+    startup_autoplay();
+}
+
+static void format_time(char *buf, size_t buf_sz, float secs)
+{
+    if (secs < 0) secs = 0;
+    int m = (int)(secs / 60);
+    int s = (int)secs % 60;
+    snprintf(buf, buf_sz, "%d:%02d", m, s);
+}
+
 static void timeline(Rectangle timeline_boundary, Track *track)
 {
     DrawRectangleRec(timeline_boundary, COLOR_TIMELINE_BACKGROUND);
+
+    // Lazy waveform loading
+    if (p->prev_track_index != p->current_track) {
+        unload_preview_waveform();
+        if (track) {
+            load_preview_waveform(track->file_path);
+        }
+        p->prev_track_index = p->current_track;
+    }
+
+    // Draw waveform
+    if (p->preview_wave_samples && p->preview_wave.frameCount > 0) {
+        size_t total_frames = p->preview_wave.frameCount;
+        size_t channels = p->preview_wave.channels;
+        float h = timeline_boundary.height;
+        float mid_y = timeline_boundary.y + h / 2;
+        Color wave_color = ColorAlpha(WHITE, 0.25);
+
+        for (int x = 0; x < (int)timeline_boundary.width; x++) {
+            size_t start = (size_t)((float)x / timeline_boundary.width * total_frames);
+            size_t end = (size_t)((float)(x + 1) / timeline_boundary.width * total_frames);
+            if (end > total_frames) end = total_frames;
+            if (start >= end) continue;
+
+            float min_val = 0.0f, max_val = 0.0f;
+            for (size_t f = start; f < end; f++) {
+                float sum = 0.0f;
+                for (size_t c = 0; c < channels; c++) {
+                    sum += p->preview_wave_samples[f * channels + c];
+                }
+                float val = sum / (float)channels;
+                if (val < min_val) min_val = val;
+                if (val > max_val) max_val = val;
+            }
+
+            float y0 = mid_y - max_val * h / 2;
+            float y1 = mid_y - min_val * h / 2;
+            if (y0 > y1) { float tmp = y0; y0 = y1; y1 = tmp; }
+            DrawRectangle(x, (int)y0, 1, (int)(y1 - y0 + 1), wave_color);
+        }
+    }
 
     float played = GetMusicTimePlayed(track->music);
     float len = GetMusicTimeLength(track->music);
@@ -620,17 +1390,51 @@ static void timeline(Rectangle timeline_boundary, Track *track)
     };
     DrawLineEx(startPos, endPos, 10, COLOR_TIMELINE_CURSOR);
 
+    // Time labels
+    {
+        float fs = 18;
+        char buf[32];
+
+        // Current time at cursor
+        format_time(buf, sizeof(buf), played);
+        Vector2 cur_sz = MeasureTextEx(p->font, buf, fs, 0);
+        float cur_x = x - cur_sz.x/2;
+        if (cur_x < timeline_boundary.x) cur_x = timeline_boundary.x;
+        if (cur_x + cur_sz.x > timeline_boundary.x + timeline_boundary.width)
+            cur_x = timeline_boundary.x + timeline_boundary.width - cur_sz.x;
+        float cur_y = timeline_boundary.y + 5;
+        DrawRectangleRec((Rectangle){cur_x - 3, cur_y - 2, cur_sz.x + 6, cur_sz.y + 4}, ColorAlpha(COLOR_TIMELINE_BACKGROUND, 0.8f));
+        DrawTextEx(p->font, buf, (Vector2){cur_x, cur_y}, fs, 0, COLOR_TIMELINE_CURSOR);
+
+        // Remaining time at right edge
+        format_time(buf, sizeof(buf), len - played);
+        Vector2 rem_sz = MeasureTextEx(p->font, buf, fs, 0);
+        float rem_x = timeline_boundary.x + timeline_boundary.width - rem_sz.x - 5;
+        float rem_y = timeline_boundary.y + timeline_boundary.height - rem_sz.y - 5;
+        DrawRectangleRec((Rectangle){rem_x - 3, rem_y - 2, rem_sz.x + 6, rem_sz.y + 4}, ColorAlpha(COLOR_TIMELINE_BACKGROUND, 0.8f));
+        DrawTextEx(p->font, buf, (Vector2){rem_x, rem_y}, fs, 0, ColorAlpha(WHITE, 0.6f));
+    }
+
+    static bool dragging = false;
     Vector2 mouse = GetMousePosition();
-    if (CheckCollisionPointRec(mouse, timeline_boundary)) {
+    if (dragging) {
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            dragging = false;
+        } else {
+            float t = (mouse.x - timeline_boundary.x)/timeline_boundary.width;
+            if (t < 0) t = 0;
+            if (t > 1) t = 1;
+            SeekMusicStream(track->music, t*len);
+        }
+    } else if (CheckCollisionPointRec(mouse, timeline_boundary)) {
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            dragging = true;
             float t = (mouse.x - timeline_boundary.x)/timeline_boundary.width;
             SeekMusicStream(track->music, t*len);
         }
-
     }
 
     // TODO: enable the user to render a specific region instead of the whole song.
-    // TODO: visualize sound wave on the timeline
 }
 
 typedef enum {
@@ -723,6 +1527,7 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
     DrawRectangleRec(panel_boundary, COLOR_TRACK_PANEL_BACKGROUND);
 
     Vector2 mouse = GetMousePosition();
+    bool any_mouse_press = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 
     float scroll_bar_width = panel_boundary.width*0.03;
     float item_size = panel_boundary.width*0.2;
@@ -743,6 +1548,49 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
         panel_scroll = (mouse.y - panel_boundary.y - scrolling_mouse_offset)/visible_area_size*entire_scrollable_area;
     }
 
+    // Drag-and-drop state
+    static ssize_t drag_from = -1;
+    static float drag_start_mouse_y = 0;
+    static bool is_dragging = false;
+
+    // End drag on mouse release
+    if (drag_from >= 0 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        if (is_dragging) {
+            size_t from = (size_t)drag_from;
+            float list_y = mouse.y - panel_boundary.y + panel_scroll - item_size*0.1f;
+            ssize_t raw_target = (ssize_t)(list_y / item_size);
+            if (raw_target < 0) raw_target = 0;
+            if ((size_t)raw_target > p->tracks.count) raw_target = (ssize_t)p->tracks.count;
+            size_t to = (size_t)raw_target;
+
+            if (from < to) to--;
+            if (to != from && to < p->tracks.count) {
+                Track tmp = p->tracks.items[from];
+                if (from < to) {
+                    memmove(&p->tracks.items[from], &p->tracks.items[from + 1],
+                            (to - from) * sizeof(Track));
+                } else {
+                    memmove(&p->tracks.items[to + 1], &p->tracks.items[to],
+                            (from - to) * sizeof(Track));
+                }
+                p->tracks.items[to] = tmp;
+                if (p->current_track == (int)from) {
+                    p->current_track = (int)to;
+                } else if (from < to) {
+                    if (p->current_track > (int)from && p->current_track <= (int)to) {
+                        p->current_track--;
+                    }
+                } else {
+                    if (p->current_track >= (int)to && p->current_track < (int)from) {
+                        p->current_track++;
+                    }
+                }
+            }
+        }
+        drag_from = -1;
+        is_dragging = false;
+    }
+
     float min_scroll = 0;
     if (panel_scroll < min_scroll) panel_scroll = min_scroll;
     float max_scroll = entire_scrollable_area - visible_area_size;
@@ -754,6 +1602,9 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
     id = djb2(id, file, strlen(file));
     id = djb2(id, &line, sizeof(line));
 
+    ssize_t remove_index = -1;
+    ssize_t move_from = -1;
+
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Rectangle item_boundary = {
             .x = panel_boundary.x + panel_padding,
@@ -761,73 +1612,319 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
             .width = panel_boundary.width - panel_padding*2 - scroll_bar_width,
             .height = item_size - panel_padding*2,
         };
-        Color color;
-        if (((int) i != p->current_track)) {
-            uint64_t item_id = djb2(id, &i, sizeof(i));
 
-            int state = button_with_id(item_id, GetCollisionRec(panel_boundary, item_boundary));
-            if (state & BS_HOVEROVER) {
-                color = COLOR_TRACK_BUTTON_HOVEROVER;
-            } else {
-                color = COLOR_TRACK_BUTTON_BACKGROUND;
+        if (item_boundary.y + item_boundary.height < panel_boundary.y ||
+            item_boundary.y > panel_boundary.y + panel_boundary.height)
+            continue;
+
+        bool is_current = ((int)i == p->current_track);
+        uint64_t item_id = djb2(id, &i, sizeof(i));
+
+        // Manually compute hover (doesn't consume active_button_id)
+        Rectangle clipped_item = GetCollisionRec(panel_boundary, item_boundary);
+        bool item_hover = CheckCollisionPointRec(mouse, clipped_item);
+
+        // Action button dimensions (needed for layout, before item row check)
+        float cover_size = item_boundary.height * 0.75;
+        float cover_pad = (item_boundary.height - cover_size) / 2;
+        float text_x = item_boundary.x + cover_size + cover_pad * 3;
+        float btn_w = item_hover && p->tracks.count > 1 ? item_boundary.height * 0.4 * 3 : 0;
+
+        // Action button STATE detection (BEFORE item row, so they claim active_button_id)
+        int action_bs_up = 0, action_bs_dn = 0, action_bs_rm = 0;
+        if (item_hover && p->tracks.count > 1) {
+            float bsize = item_boundary.height * 0.4;
+            float bx = item_boundary.x + item_boundary.width - bsize * 3 - 5;
+            float by = item_boundary.y + (item_boundary.height - bsize) / 2;
+
+            if (i > 0) {
+                Rectangle btn = { bx, by, bsize, bsize };
+                uint64_t bid = djb2(item_id, "up", 2);
+                action_bs_up = button_with_id(bid, btn);
+                if (action_bs_up & BS_CLICKED) move_from = (ssize_t)i;
             }
-            if (state & BS_CLICKED) {
-                Track *track = current_track();
-                if (track) StopMusicStream(track->music);
-                PlayMusicStream(p->tracks.items[i].music);
-                p->current_track = i;
+            if (i + 1 < p->tracks.count) {
+                Rectangle btn = { bx + bsize, by, bsize, bsize };
+                uint64_t bid = djb2(item_id, "dn", 2);
+                action_bs_dn = button_with_id(bid, btn);
+                if (action_bs_dn & BS_CLICKED) move_from = (ssize_t)i + 1;
             }
-        } else {
-            color = COLOR_TRACK_BUTTON_SELECTED;
+            {
+                Rectangle btn = { bx + bsize * 2, by, bsize, bsize };
+                uint64_t bid = djb2(item_id, "rm", 2);
+                action_bs_rm = button_with_id(bid, btn);
+                if (action_bs_rm & BS_CLICKED) remove_index = (ssize_t)i;
+            }
         }
-        // TODO: enable MSAA so the rounded rectangles look better
-        // That triggers an old raylib bug with circles tho, so we will have to look into that
+
+        // Drag start: left-click on item body (not on action buttons)
+        if (drag_from < 0 && item_hover && any_mouse_press) {
+            bool on_action_btn = false;
+            if (p->tracks.count > 1) {
+                float dbsize = item_boundary.height * 0.4f;
+                float dbx = item_boundary.x + item_boundary.width - dbsize * 3.f - 5.f;
+                float dby = item_boundary.y + (item_boundary.height - dbsize) / 2.f;
+                if (i > 0)                on_action_btn = on_action_btn || CheckCollisionPointRec(mouse, (Rectangle){dbx, dby, dbsize, dbsize});
+                if (i + 1 < p->tracks.count) on_action_btn = on_action_btn || CheckCollisionPointRec(mouse, (Rectangle){dbx + dbsize, dby, dbsize, dbsize});
+                on_action_btn = on_action_btn || CheckCollisionPointRec(mouse, (Rectangle){dbx + dbsize * 2.f, dby, dbsize, dbsize});
+            }
+            if (!on_action_btn) {
+                drag_from = (ssize_t)i;
+                drag_start_mouse_y = mouse.y;
+            }
+        }
+
+        // Item row button (won't steal click from action buttons)
+        int state = button_with_id(item_id, clipped_item);
+
+        Color color;
+        if (is_current) {
+            color = COLOR_TRACK_BUTTON_SELECTED;
+        } else if (state & BS_HOVEROVER) {
+            color = COLOR_TRACK_BUTTON_HOVEROVER;
+        } else {
+            color = COLOR_TRACK_BUTTON_BACKGROUND;
+        }
+
+        if (state & BS_CLICKED && !is_current) {
+            play_track((int)i);
+        }
+
+        if (is_dragging && drag_from == (ssize_t)i) continue;
+
         DrawRectangleRounded(item_boundary, 0.2, 20, color);
 
-        const char *text = GetFileName(p->tracks.items[i].file_path);
-        float fontSize = item_boundary.height*0.5;
-        float text_padding = item_boundary.width*0.05;
-        Vector2 size = MeasureTextEx(p->font, text, fontSize, 0);
-        Vector2 position = {
-            .x = item_boundary.x + text_padding,
-            .y = item_boundary.y + item_boundary.height*0.5 - size.y*0.5,
-        };
-        // TODO: use SDF fonts
-        // Label overflow scroll handler
-        float max_width = item_boundary.width - text_padding*2;
-        uint64_t item_id = djb2(id, &i, sizeof(i));
-        int state = button_with_id(item_id, GetCollisionRec(panel_boundary, item_boundary));
+        // Cover art thumbnail
+        if (p->tracks.items[i].has_cover) {
+            Rectangle dest = {
+                .x = item_boundary.x + cover_pad,
+                .y = item_boundary.y + cover_pad,
+                .width = cover_size,
+                .height = cover_size,
+            };
+            Rectangle source = { 0, 0, (float)p->tracks.items[i].cover.width, (float)p->tracks.items[i].cover.height };
+            DrawTexturePro(p->tracks.items[i].cover, source, dest, (Vector2){0}, 0, WHITE);
+        } else {
+            Rectangle dest = {
+                .x = item_boundary.x + cover_pad,
+                .y = item_boundary.y + cover_pad,
+                .width = cover_size,
+                .height = cover_size,
+            };
+            DrawRectangleRounded(dest, 0.2, 10, ColorAlpha(WHITE, 0.05));
+        }
 
-        if ((size.x > max_width)) { // <-- Item needs ScissorMode
-            BeginScissorMode(position.x, position.y, max_width, item_boundary.height);
+        // Draw action buttons (AFTER item background)
+        if (item_hover && p->tracks.count > 1) {
+            float bsize = item_boundary.height * 0.4;
+            float bx = item_boundary.x + item_boundary.width - bsize * 3 - 5;
+            float by = item_boundary.y + (item_boundary.height - bsize) / 2;
 
-            if (state & BS_HOVEROVER) { // <-- Current item is being hovered on and needs scrolling
-                static float dt = 0;
-                static uint64_t hovered_label_id = 0;
-                static int px_shift = 0;
-                static bool scroll_left = true;
-
-                dt += GetFrameTime();
-                if (item_id != hovered_label_id) { // <-- But it is not same as the last hovered item, so reset the shift
-                    px_shift = 0;
-                    scroll_left = true;
-                    hovered_label_id = item_id;
-                } else { // <-- it is same as the last hovered item, so count the shift
-                    if (dt > TRACKLABEL_SCROLL_SECS) {
-                        dt = 0.0f;
-                        if ((abs(px_shift) >= size.x - max_width + 10) || (px_shift == 10)) { // <-- End of scroll (with 10 padding)
-                            scroll_left = !scroll_left; // <-- flip direction
-                        }
-                        scroll_left ? --px_shift : ++px_shift;
-                    }
-                }
-                position.x += px_shift; // <-- Apply the shift
+            if (i > 0) {
+                Rectangle btn = { bx, by, bsize, bsize };
+                Color bc = (action_bs_up & BS_HOVEROVER) ? COLOR_ACCENT : ColorAlpha(WHITE, 0.4f);
+                DrawRectangleRounded(btn, 0.3, 10, bc);
+                float lw = bsize * 0.15f, cx = btn.x + btn.width / 2, cy = btn.y + btn.height / 2, ht = bsize * 0.25f;
+                DrawLineEx((Vector2){cx, cy - ht}, (Vector2){cx - ht, cy}, lw, WHITE);
+                DrawLineEx((Vector2){cx, cy - ht}, (Vector2){cx + ht, cy}, lw, WHITE);
             }
-            track_label(p->font, text, position, fontSize, WHITE);
-            EndScissorMode();
+            if (i + 1 < p->tracks.count) {
+                Rectangle btn = { bx + bsize, by, bsize, bsize };
+                Color bc = (action_bs_dn & BS_HOVEROVER) ? COLOR_ACCENT : ColorAlpha(WHITE, 0.4f);
+                DrawRectangleRounded(btn, 0.3, 10, bc);
+                float lw = bsize * 0.15f, cx = btn.x + btn.width / 2, cy = btn.y + btn.height / 2, ht = bsize * 0.25f;
+                DrawLineEx((Vector2){cx, cy + ht}, (Vector2){cx - ht, cy}, lw, WHITE);
+                DrawLineEx((Vector2){cx, cy + ht}, (Vector2){cx + ht, cy}, lw, WHITE);
+            }
+            {
+                Rectangle btn = { bx + bsize * 2, by, bsize, bsize };
+                Color bc = (action_bs_rm & BS_HOVEROVER) ? (Color){255, 60, 60, 255} : ColorAlpha(WHITE, 0.4f);
+                DrawRectangleRounded(btn, 0.3, 10, bc);
+                float lw = bsize * 0.15f, cx = btn.x + btn.width / 2, cy = btn.y + btn.height / 2, ht = bsize * 0.25f;
+                DrawLineEx((Vector2){cx - ht, cy - ht}, (Vector2){cx + ht, cy + ht}, lw, WHITE);
+                DrawLineEx((Vector2){cx + ht, cy - ht}, (Vector2){cx - ht, cy + ht}, lw, WHITE);
+            }
+        }
 
-        } else { // <-- No need for ScissorMode
-            track_label(p->font, text, position, fontSize, WHITE);
+        float text_padding = 5;
+        float max_width = item_boundary.x + item_boundary.width - text_x - text_padding - btn_w;
+        if (max_width < 10) max_width = 10;
+
+        const char *text = GetFileName(p->tracks.items[i].file_path);
+        float fontSize = item_boundary.height * 0.45;
+        Vector2 size = MeasureTextEx(p->font, text, fontSize, 0);
+
+        // Track label
+        {
+            Vector2 position = {
+                .x = text_x,
+                .y = item_boundary.y + item_boundary.height*0.5 - size.y*0.5,
+            };
+            if (size.x > max_width) {
+                BeginScissorMode(position.x, position.y, max_width, item_boundary.height);
+                if (state & BS_HOVEROVER) {
+                    static float dt = 0;
+                    static uint64_t hovered_label_id = 0;
+                    static int px_shift = 0;
+                    static bool scroll_left = true;
+                    dt += GetFrameTime();
+                    if (item_id != hovered_label_id) {
+                        px_shift = 0;
+                        scroll_left = true;
+                        hovered_label_id = item_id;
+                    } else {
+                        if (dt > TRACKLABEL_SCROLL_SECS) {
+                            dt = 0.0f;
+                            if ((abs(px_shift) >= (int)(size.x - max_width + 10)) || (px_shift == 10)) {
+                                scroll_left = !scroll_left;
+                            }
+                            scroll_left ? --px_shift : ++px_shift;
+                        }
+                    }
+                    position.x += (float)px_shift;
+                }
+                track_label(p->font, text, position, fontSize, WHITE);
+                EndScissorMode();
+            } else {
+                track_label(p->font, text, position, fontSize, WHITE);
+            }
+        }
+
+        // Duration
+        {
+            float len = GetMusicTimeLength(p->tracks.items[i].music);
+            if (len > 0) {
+                char buf[32];
+                format_time(buf, sizeof(buf), len);
+                float fs = item_boundary.height * 0.35;
+                Vector2 sz = MeasureTextEx(p->font, buf, fs, 0);
+                float dx = item_boundary.x + item_boundary.width - text_padding - btn_w - sz.x - 5;
+                if (dx >= text_x + 10) {
+                    DrawTextEx(p->font, buf, (Vector2){dx, item_boundary.y + item_boundary.height*0.5 - sz.y*0.5}, fs, 0, ColorAlpha(WHITE, 0.4f));
+                }
+            }
+        }
+    }
+
+    // Drag visuals
+    if (drag_from >= 0 && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        if (!is_dragging && fabsf(mouse.y - drag_start_mouse_y) > item_size * 0.2f) {
+            is_dragging = true;
+        }
+        if (is_dragging) {
+            float list_y = mouse.y - (panel_boundary.y + panel_padding - panel_scroll);
+            ssize_t zone = (ssize_t)(list_y / item_size + 0.5f);
+            if (zone < 0) zone = 0;
+            if ((size_t)zone > p->tracks.count) zone = (ssize_t)p->tracks.count;
+            if (zone == drag_from || zone == drag_from + 1) zone = -1;
+
+            // Auto-scroll when near panel edges
+            float edge_margin = item_size * 0.5f;
+            if (mouse.y < panel_boundary.y + edge_margin) {
+                panel_velocity = -item_size * 10;
+            } else if (mouse.y > panel_boundary.y + panel_boundary.height - edge_margin) {
+                panel_velocity = item_size * 10;
+            }
+
+            // Drop indicator line
+            if (zone >= 0) {
+                float line_y = (float)zone * item_size + panel_boundary.y + panel_padding - panel_scroll;
+                Rectangle line = {
+                    panel_boundary.x + panel_padding,
+                    line_y - 2,
+                    panel_boundary.width - panel_padding * 2 - scroll_bar_width,
+                    3,
+                };
+                BeginScissorMode(panel_boundary.x, panel_boundary.y, panel_boundary.width - scroll_bar_width, panel_boundary.height);
+                DrawRectangleRec(line, COLOR_ACCENT);
+                EndScissorMode();
+            }
+
+            // Dragged item at cursor
+            Track *dt = &p->tracks.items[drag_from];
+            float drag_item_h = item_size - panel_padding * 2;
+            float drag_item_w = panel_boundary.width - panel_padding * 2 - scroll_bar_width;
+            Rectangle drag_boundary = {
+                mouse.x - drag_item_w * 0.3f,
+                mouse.y - drag_item_h * 0.1f,
+                drag_item_w,
+                drag_item_h,
+            };
+            if (drag_boundary.x < panel_boundary.x + panel_padding) drag_boundary.x = panel_boundary.x + panel_padding;
+            if (drag_boundary.x + drag_boundary.width > panel_boundary.x + panel_boundary.width - panel_padding - scroll_bar_width)
+                drag_boundary.x = panel_boundary.x + panel_boundary.width - panel_padding - scroll_bar_width - drag_boundary.width;
+            BeginScissorMode(panel_boundary.x, panel_boundary.y, panel_boundary.width - scroll_bar_width, panel_boundary.height);
+            DrawRectangleRounded(drag_boundary, 0.2, 20, ColorAlpha(COLOR_ACCENT, 0.7f));
+            float dcover = drag_boundary.height * 0.75f;
+            float dpad = (drag_boundary.height - dcover) / 2;
+            if (dt->has_cover) {
+                Rectangle dsrc = {0, 0, (float)dt->cover.width, (float)dt->cover.height};
+                Rectangle ddest = {drag_boundary.x + dpad, drag_boundary.y + dpad, dcover, dcover};
+                DrawTexturePro(dt->cover, dsrc, ddest, (Vector2){0}, 0, ColorAlpha(WHITE, 0.8f));
+            }
+            const char *dtext = GetFileName(dt->file_path);
+            float dfs = drag_boundary.height * 0.45f;
+            Vector2 dtext_sz = MeasureTextEx(p->font, dtext, dfs, 0);
+            float dtx = drag_boundary.x + dcover + dpad * 3;
+            float dty = drag_boundary.y + drag_boundary.height * 0.5f - dtext_sz.y * 0.5f;
+            track_label(p->font, dtext, (Vector2){dtx, dty}, dfs, ColorAlpha(WHITE, 0.8f));
+            EndScissorMode();
+        }
+    }
+
+    // Deferred actions
+    if (remove_index >= 0) {
+        bool was_current = p->current_track == (int)remove_index;
+        Track *t = &p->tracks.items[remove_index];
+        if (t->has_cover) UnloadTexture(t->cover);
+        DetachAudioStreamProcessor(t->music.stream, callback);
+
+        // Stop crossfade if the removed track is involved
+        if (p->crossfading) {
+            StopMusicStream(p->crossfade_music);
+            p->crossfading = false;
+        }
+
+        if (was_current) StopMusicStream(t->music);
+        UnloadMusicStream(t->music);
+        free(t->file_path);
+        memmove(&p->tracks.items[remove_index], &p->tracks.items[remove_index + 1],
+                (p->tracks.count - (size_t)remove_index - 1) * sizeof(Track));
+        p->tracks.count--;
+        if (was_current) {
+            if ((size_t)remove_index < p->tracks.count) {
+                SeekMusicStream(p->tracks.items[remove_index].music, 0);
+                PlayMusicStream(p->tracks.items[remove_index].music);
+                p->current_track = (int)remove_index;
+            } else if (p->tracks.count > 0) {
+                p->current_track = (int)p->tracks.count - 1;
+                SeekMusicStream(p->tracks.items[p->current_track].music, 0);
+                PlayMusicStream(p->tracks.items[p->current_track].music);
+            } else {
+                p->current_track = -1;
+            }
+        } else if (p->current_track > (int)remove_index) {
+            p->current_track--;
+        }
+    }
+    if (move_from >= 0) {
+        size_t from = (size_t)move_from;
+        size_t to = (from > 0 && from < p->tracks.count) ? from - 1 : (from + 1 < p->tracks.count ? from + 1 : from);
+        if (to != from) {
+            Track tmp = p->tracks.items[from];
+            if (from < to) {
+                memmove(&p->tracks.items[from], &p->tracks.items[from + 1],
+                        (to - from) * sizeof(Track));
+            } else {
+                memmove(&p->tracks.items[to + 1], &p->tracks.items[to],
+                        (from - to) * sizeof(Track));
+            }
+            p->tracks.items[to] = tmp;
+            if (p->current_track == (int)from) {
+                p->current_track = (int)to;
+            } else if (p->current_track == (int)to) {
+                p->current_track = (int)from;
+            }
         }
     }
 
@@ -1107,8 +2204,8 @@ static void popup_tray(Popup_Tray *pt, Rectangle preview_boundary)
             .width = popup_width,
             .height = popup_height,
         };
-        DrawRectangleRounded(popup_boundary, 0.3, 20, ColorAlpha(COLOR_POPUP_BACKGROUND, alpha));
-        const char *text = "Could not load file";
+        DrawRectangleRounded(popup_boundary, 0.3, 20, ColorAlpha(it->success ? COLOR_POPUP_SUCCESS : COLOR_POPUP_BACKGROUND, alpha));
+        const char *text = it->message;
         float fontSize = popup_boundary.width*0.15;
         Vector2 size = MeasureTextEx(p->font, text, fontSize, 0);
         Vector2 position = {
@@ -1355,9 +2452,9 @@ static bool toolbar(Track *track, Rectangle boundary)
     int state = 0;
 
 #ifdef MUSIALIZER_MICROPHONE
-    size_t buttons_count = 5;
+    size_t buttons_count = 6;
 #else
-    size_t buttons_count = 4;
+    size_t buttons_count = 5;
 #endif // MUSIALIZER_MICROPHONE
 
     if (boundary.width < HUD_BUTTON_SIZE*buttons_count) return interacted;
@@ -1404,7 +2501,66 @@ static bool toolbar(Track *track, Rectangle boundary)
     }
 #endif // MUSIALIZER_MICROPHONE
 
-    // TODO: implement "add new track" button that uses tinyfiledialogs
+    state = button((CLITERAL(Rectangle) {
+        x,
+        boundary.y,
+        HUD_BUTTON_SIZE,
+        HUD_BUTTON_SIZE,
+    }));
+    {
+        Color color = (state & BS_HOVEROVER) ? COLOR_HUD_BUTTON_HOVEROVER : COLOR_HUD_BUTTON_BACKGROUND;
+        DrawRectangleRec((Rectangle){x, boundary.y, HUD_BUTTON_SIZE, HUD_BUTTON_SIZE}, color);
+
+        float icon_size = 512;
+        float scale = HUD_BUTTON_SIZE/icon_size*HUD_ICON_SCALE;
+        float s = icon_size*scale;
+        float t = s*0.25f;
+        float cx = x + HUD_BUTTON_SIZE/2;
+        float cy = boundary.y + HUD_BUTTON_SIZE/2;
+        DrawLineEx((Vector2){cx - t, cy}, (Vector2){cx + t, cy}, s*0.1f, ColorBrightness(WHITE, -0.10));
+        DrawLineEx((Vector2){cx, cy - t}, (Vector2){cx, cy + t}, s*0.1f, ColorBrightness(WHITE, -0.10));
+        tooltip((Rectangle){x, boundary.y, HUD_BUTTON_SIZE, HUD_BUTTON_SIZE}, "Add Track", SIDE_TOP, false);
+    }
+    x += HUD_BUTTON_SIZE;
+    if (state & BS_CLICKED) {
+        interacted = true;
+        open_files_dialog();
+    }
+
+    // Save playlist button
+    state = button((CLITERAL(Rectangle) {
+        x,
+        boundary.y,
+        HUD_BUTTON_SIZE,
+        HUD_BUTTON_SIZE,
+    }));
+    {
+        Color color = (state & BS_HOVEROVER) ? COLOR_HUD_BUTTON_HOVEROVER : COLOR_HUD_BUTTON_BACKGROUND;
+        DrawRectangleRec((Rectangle){x, boundary.y, HUD_BUTTON_SIZE, HUD_BUTTON_SIZE}, color);
+        float s = HUD_BUTTON_SIZE * 0.5f;
+        float cx = x + HUD_BUTTON_SIZE/2;
+        float cy = boundary.y + HUD_BUTTON_SIZE/2;
+        float lw = s * 0.12f;
+        // Diskette shape
+        DrawRectangleLinesEx((Rectangle){cx - s/2, cy - s/2, s, s}, lw, ColorBrightness(WHITE, -0.10));
+        DrawRectangle((int)(cx - s/3), (int)(cy - s/3), (int)(s*2/3), (int)(s*2/3), ColorBrightness(WHITE, -0.10));
+        DrawRectangle((int)(cx - s/4), (int)(cy + s/6), (int)(s/2), (int)(s/3), ColorBrightness(WHITE, -0.20));
+        tooltip((Rectangle){x, boundary.y, HUD_BUTTON_SIZE, HUD_BUTTON_SIZE}, "Save Playlist", SIDE_TOP, false);
+    }
+    x += HUD_BUTTON_SIZE;
+    if (state & BS_CLICKED) {
+        interacted = true;
+        const char *save_path = tinyfd_saveFileDialog("Save Playlist", "playlist.m3u", 1, (const char *[]){ "*.m3u", "*.m3u8" }, "M3U Playlist");
+        if (save_path) {
+            FILE *f = fopen(save_path, "w");
+            if (f) {
+                for (size_t i = 0; i < p->tracks.count; i++) {
+                    fprintf(f, "%s\n", p->tracks.items[i].file_path);
+                }
+                fclose(f);
+            }
+        }
+    }
 
     bool volume_slider_interacted = volume_slider((CLITERAL(Rectangle) {
         x,
@@ -1436,28 +2592,16 @@ static void preview_screen(void)
 
     if (IsFileDropped()) {
         FilePathList droppedFiles = LoadDroppedFiles();
-        // TODO: loading files synchronously like that actually blocks the UI thread
-        // Maybe we should do that in a separate thread.
         for (size_t i = 0; i < droppedFiles.count; ++i) {
-            Music music = LoadMusicStream(droppedFiles.paths[i]);
-            if (IsMusicValid(music)) {
-                AttachAudioStreamProcessor(music.stream, callback);
-                char *file_path = strdup(droppedFiles.paths[i]);
-                assert(file_path != NULL);
-                nob_da_append(&p->tracks, (CLITERAL(Track) {
-                    .file_path = file_path,
-                    .music = music,
-                }));
+            const char *ext = GetFileExtension(droppedFiles.paths[i]);
+            if (ext && (strcmp(ext, ".m3u") == 0 || strcmp(ext, ".m3u8") == 0)) {
+                load_m3u_playlist(droppedFiles.paths[i]);
             } else {
-                popup_tray_push(&p->pt);
+                load_track_from_path(droppedFiles.paths[i]);
             }
         }
         UnloadDroppedFiles(droppedFiles);
-
-        if (current_track() == NULL && p->tracks.count > 0) {
-            p->current_track = 0;
-            PlayMusicStream(p->tracks.items[0].music);
-        }
+        startup_autoplay();
     }
 
 #ifdef MUSIALIZER_MICROPHONE
@@ -1468,18 +2612,83 @@ static void preview_screen(void)
     if (track) { // The music is loaded and ready
         UpdateMusicStream(track->music);
 
-        if (IsKeyPressed(KEY_TOGGLE_PLAY)) {
-            toggle_track_playing(track);
+        // Now-playing banner timer
+        if (p->now_playing_timer > 0) {
+            p->now_playing_timer -= GetFrameTime();
         }
 
-        if (IsKeyPressed(KEY_RENDER)) {
-            start_rendering_track(track);
+        // Crossfade
+        if (p->crossfading) {
+            UpdateMusicStream(p->crossfade_music);
+            p->crossfade_timer += GetFrameTime();
+            float t = p->crossfade_timer / p->crossfade_duration;
+            if (t >= 1.0f) {
+                t = 1.0f;
+                StopMusicStream(p->crossfade_music);
+                p->crossfading = false;
+            }
+            SetMusicVolume(p->crossfade_music, GetMasterVolume() * (1.0f - t));
+            SetMusicVolume(track->music, GetMasterVolume() * t);
         }
 
-        if (IsKeyPressed(KEY_FULLSCREEN)) {
-            p->fullscreen = !p->fullscreen;
+        // Auto-advance when track ends
+        if (p->track_was_playing && !IsMusicStreamPlaying(track->music)) {
+            float len = GetMusicTimeLength(track->music);
+            float played = GetMusicTimePlayed(track->music);
+            if (len > 0 && played < 0.1f) {
+                if (p->repeat_mode == REPEAT_ALL) {
+                    SeekMusicStream(track->music, 0);
+                    PlayMusicStream(track->music);
+                } else if (p->current_track + 1 < (int)p->tracks.count) {
+                    play_track(p->current_track + 1);
+                }
+                track = current_track();
+            }
+        }
+        p->track_was_playing = IsMusicStreamPlaying(track->music);
+
+        if (track) {
+            if (IsKeyPressed(KEY_TOGGLE_PLAY)) {
+                toggle_track_playing(track);
+            }
+
+            if (IsKeyPressed(KEY_RENDER) && IS_CTRL_DOWN) {
+                start_rendering_track(track);
+            }
+
+            if (IsKeyPressed(KEY_FULLSCREEN)) {
+                p->fullscreen = !p->fullscreen;
+            }
+
+            if (IsKeyPressed(KEY_RIGHT)) {
+                next_track();
+                track = current_track();
+            }
+
+            if (IsKeyPressed(KEY_LEFT)) {
+                prev_track();
+                track = current_track();
+            }
+
+            if (IsKeyPressed(KEY_R)) {
+                p->repeat_mode = (p->repeat_mode + 1) % 2;
+                p->repeat_mode_label_timer = 1.5f;
+            }
+
+            if (IsKeyPressed(KEY_S)) {
+                p->shuffle = !p->shuffle;
+            }
+
+            if (IsKeyPressed(KEY_V)) {
+                p->viz_mode = (p->viz_mode + 1) % COUNT_VIZ_MODES;
+            }
+
+            if (IsKeyPressed(KEY_H)) {
+                p->show_help = !p->show_help;
+            }
         }
 
+        if (track == NULL) return;
         size_t m = fft_analyze(GetFrameTime());
 
         float toolbar_height = HUD_BUTTON_SIZE;
@@ -1524,6 +2733,19 @@ static void preview_screen(void)
 #endif
 
             popup_tray(&p->pt, preview_boundary);
+
+            // Now-playing banner
+            if (p->now_playing_timer > 0 && track) {
+                float fs = 22;
+                const char *name = GetFileName(track->file_path);
+                Vector2 sz = MeasureTextEx(p->font, name, fs, 0);
+                float banner_h = sz.y + 20;
+                float banner_y = preview_boundary.y + 10;
+                float alpha = p->now_playing_timer > 0.5f ? 1.0f : p->now_playing_timer / 0.5f;
+                Rectangle bg = { preview_boundary.x + preview_boundary.width/2 - sz.x/2 - 15, banner_y, sz.x + 30, banner_h };
+                DrawRectangleRounded(bg, 0.3, 10, ColorAlpha(COLOR_BACKGROUND, 0.85f * alpha));
+                DrawTextEx(p->font, name, (Vector2){bg.x + 15, bg.y + 10}, fs, 0, ColorAlpha(WHITE, alpha));
+            }
         } else {
             float tracks_panel_width = 320.0f;
             float timeline_height = 150.0f;
@@ -1548,12 +2770,77 @@ static void preview_screen(void)
             popup_tray(&p->pt, preview_boundary);
             EndScissorMode();
 
+            // Now-playing banner
+            if (p->now_playing_timer > 0 && track) {
+                float fs = 22;
+                const char *name = GetFileName(track->file_path);
+                Vector2 sz = MeasureTextEx(p->font, name, fs, 0);
+                float banner_h = sz.y + 20;
+                float banner_y = preview_boundary.y + 10;
+                float alpha = p->now_playing_timer > 0.5f ? 1.0f : p->now_playing_timer / 0.5f;
+                Rectangle bg = { preview_boundary.x + preview_boundary.width/2 - sz.x/2 - 15, banner_y, sz.x + 30, banner_h };
+                DrawRectangleRounded(bg, 0.3, 10, ColorAlpha(COLOR_BACKGROUND, 0.85f * alpha));
+                DrawTextEx(p->font, name, (Vector2){bg.x + 15, bg.y + 10}, fs, 0, ColorAlpha(WHITE, alpha));
+            }
+
+            float eq_section_height = 160.0f;
             tracks_panel((CLITERAL(Rectangle) {
                 .x = 0,
                 .y = 0,
                 .width = tracks_panel_width,
-                .height = h - timeline_height,
+                .height = h - timeline_height - eq_section_height,
             }));
+            track = current_track();
+            if (track == NULL) return;
+
+            // EQ Section
+            {
+                float eq_y = h - timeline_height - eq_section_height;
+                DrawRectangle(0, eq_y, tracks_panel_width, eq_section_height, COLOR_TRACK_PANEL_BACKGROUND);
+
+                float title_size = 20;
+                DrawTextEx(p->font, "Equalizer", (Vector2){10, eq_y + 5}, title_size, 0, WHITE);
+
+                float reset_size = 16;
+                Vector2 reset_txt = MeasureTextEx(p->font, "Reset", reset_size, 0);
+                float reset_pad = 10;
+                Rectangle reset_boundary = {
+                    tracks_panel_width - reset_txt.x - reset_pad,
+                    eq_y + 5,
+                    reset_txt.x + reset_pad,
+                    reset_txt.y,
+                };
+                int reset_state = button(reset_boundary);
+                Color reset_color = (reset_state & BS_HOVEROVER) ? COLOR_ACCENT : ColorAlpha(WHITE, 0.5f);
+                DrawTextEx(p->font, "Reset", (Vector2){reset_boundary.x + reset_pad/2, reset_boundary.y}, reset_size, 0, reset_color);
+                if (reset_state & BS_CLICKED) {
+                    p->eq_low = 0.5f;
+                    p->eq_mid = 0.5f;
+                    p->eq_high = 0.5f;
+                }
+
+                float slider_x = 10;
+                float slider_w = tracks_panel_width - 20;
+                float slider_h = 25;
+                float label_size = 14;
+                float row_h = label_size + 2 + slider_h + 4;
+                float y0 = eq_y + 30;
+
+                float y = y0;
+                DrawTextEx(p->font, "Low", (Vector2){slider_x, y}, label_size, 0, ColorAlpha(WHITE, 0.6f));
+                y += label_size + 2;
+                horz_slider((Rectangle){slider_x, y, slider_w, slider_h}, &p->eq_low, &p->eq_low_drag);
+
+                y = y0 + row_h;
+                DrawTextEx(p->font, "Mid", (Vector2){slider_x, y}, label_size, 0, ColorAlpha(WHITE, 0.6f));
+                y += label_size + 2;
+                horz_slider((Rectangle){slider_x, y, slider_w, slider_h}, &p->eq_mid, &p->eq_mid_drag);
+
+                y = y0 + row_h * 2;
+                DrawTextEx(p->font, "High", (Vector2){slider_x, y}, label_size, 0, ColorAlpha(WHITE, 0.6f));
+                y += label_size + 2;
+                horz_slider((Rectangle){slider_x, y, slider_w, slider_h}, &p->eq_high, &p->eq_high_drag);
+            }
 
             timeline(CLITERAL(Rectangle) {
                 .x = 0,
@@ -1596,28 +2883,7 @@ static void preview_screen(void)
         });
 
         if (button(((Rectangle) {0, 0, w, h})) & BS_CLICKED) {
-            int allow_multiple_selects = 0; // TODO: enable multiple selects
-            char const *filter_params[] = {"*.wav", "*.ogg", "*.mp3", "*.qoa", "*.xm", "*.mod", "*.flac"};
-            char *input_path = tinyfd_openFileDialog("Path to music file", "./", NOB_ARRAY_LEN(filter_params), filter_params, "music file", allow_multiple_selects);
-            if (input_path) {
-                Music music = LoadMusicStream(input_path);
-                if (IsMusicValid(music)) {
-                    AttachAudioStreamProcessor(music.stream, callback);
-                    char *file_path = strdup(input_path);
-                    assert(file_path != NULL);
-                    nob_da_append(&p->tracks, (CLITERAL(Track) {
-                        .file_path = file_path,
-                        .music = music,
-                    }));
-                } else {
-                    popup_tray_push(&p->pt);
-                }
-
-                if (current_track() == NULL && p->tracks.count > 0) {
-                    p->current_track = 0;
-                    PlayMusicStream(p->tracks.items[0].music);
-                }
-            }
+            open_files_dialog();
         }
     }
 }
@@ -1639,6 +2905,7 @@ static void capture_screen(void)
             const char *recording_file_path = "recording.wav";
             Music music = LoadMusicStream(recording_file_path);
             if (IsMusicValid(music)) {
+                music.looping = false;
                 AttachAudioStreamProcessor(music.stream, callback);
                 char *file_path = strdup(recording_file_path);
                 assert(file_path != NULL);
@@ -1647,7 +2914,7 @@ static void capture_screen(void)
                     .music = music,
                 }));
             } else {
-                popup_tray_push(&p->pt);
+                popup_tray_push(&p->pt, "Could not load capture", false);
             }
 
             if (current_track() == NULL && p->tracks.count > 0) {
@@ -1823,11 +3090,34 @@ static void load_assets(void)
     size_t data_size = 0;
     void *data = NULL;
 
-    const char *alegreya_path = "./resources/fonts/Alegreya-Regular.ttf";
-    data = plug_load_resource(alegreya_path, &data_size);
-        p->font = LoadFontFromMemory(GetFileExtension(alegreya_path), data, data_size, FONT_SIZE, NULL, 0);
+    const char *freesans_path = "./resources/fonts/FreeSans.ttf";
+    data = plug_load_resource(freesans_path, &data_size);
+    {
+        // Codepoints covering Latin, Cyrillic, Greek, Armenian, and CJK
+        int cp[25000];
+        int cp_count = 0;
+        // Basic Latin (0x20-0x7E)
+        for (int i = 0x20; i <= 0x7E; i++) cp[cp_count++] = i;
+        // Latin-1 Supplement (0xA0-0xFF)
+        for (int i = 0xA0; i <= 0xFF; i++) cp[cp_count++] = i;
+        // Latin Extended-A (0x100-0x17F)
+        for (int i = 0x100; i <= 0x17F; i++) cp[cp_count++] = i;
+        // Latin Extended-B (0x180-0x24F)
+        for (int i = 0x180; i <= 0x24F; i++) cp[cp_count++] = i;
+        // Cyrillic (0x400-0x4FF)
+        for (int i = 0x400; i <= 0x4FF; i++) cp[cp_count++] = i;
+        // Greek (0x370-0x3FF)
+        for (int i = 0x370; i <= 0x3FF; i++) cp[cp_count++] = i;
+        // Latin Extended Additional (0x1E00-0x1EFF)
+        for (int i = 0x1E00; i <= 0x1EFF; i++) cp[cp_count++] = i;
+        // Armenian (0x530-0x58F)
+        for (int i = 0x530; i <= 0x58F; i++) cp[cp_count++] = i;
+        // CJK Unified Ideographs (0x4E00-0x9FFF)
+        for (int i = 0x4E00; i <= 0x9FFF; i++) cp[cp_count++] = i;
+        p->font = LoadFontFromMemory(GetFileExtension(freesans_path), data, data_size, FONT_SIZE, cp, cp_count);
         GenTextureMipmaps(&p->font.texture);
         SetTextureFilter(p->font.texture, TEXTURE_FILTER_BILINEAR);
+    }
     plug_free_resource(data);
 
     // TODO: Maybe we should try to keep compiling different versions of shaders
@@ -1874,11 +3164,19 @@ MUSIALIZER_PLUG void plug_init(void)
 
     // TODO: restore master volume between sessions
     SetMasterVolume(0.5);
+    p->eq_low = 0.5f;
+    p->eq_mid = 0.5f;
+    p->eq_high = 0.5f;
+    p->prev_track_index = -1;
+    p->crossfade_duration = 3.0f;
+    p->track_was_playing = false;
     SetTargetFPS(PREVIEW_FPS);
 }
 
 MUSIALIZER_PLUG void *plug_pre_reload(void)
 {
+    unload_preview_waveform();
+    loader_stop();
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Track *it = &p->tracks.items[i];
         DetachAudioStreamProcessor(it->music.stream, callback);
@@ -1890,6 +3188,7 @@ MUSIALIZER_PLUG void *plug_pre_reload(void)
 MUSIALIZER_PLUG void plug_post_reload(void *pp)
 {
     p = pp;
+    memset(&loader, 0, sizeof(loader));
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Track *it = &p->tracks.items[i];
         AttachAudioStreamProcessor(it->music.stream, callback);
@@ -1899,6 +3198,8 @@ MUSIALIZER_PLUG void plug_post_reload(void *pp)
 
 MUSIALIZER_PLUG void plug_update(void)
 {
+    process_completed_loads();
+
     BeginDrawing();
     ClearBackground(COLOR_BACKGROUND);
 
@@ -1916,6 +3217,41 @@ MUSIALIZER_PLUG void plug_update(void)
 #endif // MUSIALIZER_MICROPHONE
     } else { // We are in the Rendering Mode
         rendering_screen();
+    }
+
+    // Keyboard shortcut overlay
+    if (p->show_help) {
+        const char *lines[] = {
+            "Space     - Play / Pause",
+            "Left      - Previous Track",
+            "Right     - Next Track",
+            "V         - Cycle Visualization",
+            "R         - Cycle Repeat Mode",
+            "Ctrl+R    - Render to Video",
+            "S         - Toggle Shuffle",
+            "F         - Toggle Fullscreen",
+            "H         - Toggle Help",
+            "",
+            "Click / Drag on Timeline to Seek",
+        };
+        int n = sizeof(lines)/sizeof(lines[0]);
+        float fs = 20;
+        float line_h = fs + 6;
+        float total_h = n * line_h + 20;
+        float max_w = 0;
+        for (int i = 0; i < n; i++) {
+            Vector2 sz = MeasureTextEx(GetFontDefault(), lines[i], fs, 0);
+            if (sz.x > max_w) max_w = sz.x;
+        }
+        float total_w = max_w + 40;
+        float ox = GetScreenWidth()/2 - total_w/2;
+        float oy = GetScreenHeight()/2 - total_h/2;
+        DrawRectangleRounded((Rectangle){ox, oy, total_w, total_h}, 0.3, 10, ColorAlpha(COLOR_BACKGROUND, 0.92f));
+        DrawRectangleRoundedLines((Rectangle){ox, oy, total_w, total_h}, 0.3, 10, ColorAlpha(WHITE, 0.1f));
+        for (int i = 0; i < n; i++) {
+            float y = oy + 10 + i * line_h;
+            DrawTextEx(GetFontDefault(), lines[i], (Vector2){ox + 20, y}, fs, 0, ColorAlpha(WHITE, 0.85f));
+        }
     }
 
     end_tooltip_frame();
