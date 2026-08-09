@@ -305,6 +305,24 @@ typedef struct {
 } Plug;
 
 static Plug *p = NULL;
+static Platform_Mutex *fft_mutex = NULL;
+static float fft_hann_window[FFT_SIZE];
+
+static void fft_buffer_init(void)
+{
+    fft_mutex = platform_mutex_create();
+    assert(fft_mutex != NULL && "Could not create FFT mutex");
+    for (size_t i = 0; i < FFT_SIZE; ++i) {
+        float t = (float)i/(FFT_SIZE - 1);
+        fft_hann_window[i] = 0.5f - 0.5f*cosf(2*PI*t);
+    }
+}
+
+static void fft_buffer_shutdown(void)
+{
+    platform_mutex_destroy(fft_mutex);
+    fft_mutex = NULL;
+}
 
 static bool fft_settled(void)
 {
@@ -318,7 +336,9 @@ static bool fft_settled(void)
 
 static void fft_clean(void)
 {
+    platform_mutex_lock(fft_mutex);
     memset(p->in_raw, 0, sizeof(p->in_raw));
+    platform_mutex_unlock(fft_mutex);
     memset(p->in_win, 0, sizeof(p->in_win));
     memset(p->out_raw, 0, sizeof(p->out_raw));
     memset(p->out_log, 0, sizeof(p->out_log));
@@ -368,11 +388,14 @@ static inline float amp(Float_Complex z)
 
 static size_t fft_analyze(float dt)
 {
+    // Snapshot the audio-thread input, then release it before doing analyzer work.
+    platform_mutex_lock(fft_mutex);
+    memcpy(p->in_win, p->in_raw, sizeof(p->in_win));
+    platform_mutex_unlock(fft_mutex);
+
     // Apply the Hann Window on the Input - https://en.wikipedia.org/wiki/Hann_function
     for (size_t i = 0; i < FFT_SIZE; ++i) {
-        float t = (float)i/(FFT_SIZE - 1);
-        float hann = 0.5 - 0.5*cosf(2*PI*t);
-        p->in_win[i] = p->in_raw[i]*hann;
+        p->in_win[i] *= fft_hann_window[i];
     }
 
     // FFT
@@ -663,10 +686,25 @@ beat_flash:
     }
 }
 
-static void fft_push(float frame)
+static void fft_push_frames(const float *samples, size_t frame_count, size_t channels)
 {
-    memmove(p->in_raw, p->in_raw + 1, (FFT_SIZE - 1)*sizeof(p->in_raw[0]));
-    p->in_raw[FFT_SIZE-1] = frame;
+    if (frame_count == 0) return;
+    assert(samples == NULL || channels > 0);
+
+    platform_mutex_lock(fft_mutex);
+
+    size_t retained = frame_count < FFT_SIZE ? FFT_SIZE - frame_count : 0;
+    if (retained > 0) {
+        memmove(p->in_raw, p->in_raw + frame_count, retained*sizeof(p->in_raw[0]));
+    }
+
+    size_t first_frame = frame_count > FFT_SIZE ? frame_count - FFT_SIZE : 0;
+    size_t output = retained;
+    for (size_t frame = first_frame; frame < frame_count; ++frame) {
+        p->in_raw[output++] = samples != NULL ? samples[frame*channels] : 0.0f;
+    }
+
+    platform_mutex_unlock(fft_mutex);
 }
 
 #define EQ_LOW_FC 300.0f
@@ -707,9 +745,7 @@ static void callback(void *bufferData, unsigned int frames)
 
     apply_audio_eq(fs, frames);
 
-    for (size_t i = 0; i < frames; ++i) {
-        fft_push(fs[i][0]);
-    }
+    fft_push_frames((float *)fs, frames, 2);
 
 #ifdef MUSIALIZER_MICROPHONE
     if (p->capturing) {
@@ -3177,14 +3213,16 @@ static void rendering_screen(void)
             {
                 size_t chunk_size = p->wave.sampleRate/RENDER_FPS;
                 float *fs = (float*)p->wave_samples;
-                for (size_t i = 0; i < chunk_size; ++i) {
-                    if (p->wave_cursor < p->wave.frameCount) {
-                        fft_push(fs[p->wave_cursor*p->wave.channels + 0]);
-                    } else {
-                        fft_push(0);
-                    }
-                    p->wave_cursor += 1;
-                }
+                size_t remaining = p->wave_cursor < p->wave.frameCount
+                    ? p->wave.frameCount - p->wave_cursor
+                    : 0;
+                size_t available = remaining < chunk_size ? remaining : chunk_size;
+                const float *samples = available > 0
+                    ? fs + p->wave_cursor*p->wave.channels
+                    : NULL;
+                fft_push_frames(samples, available, p->wave.channels);
+                fft_push_frames(NULL, chunk_size - available, 1);
+                p->wave_cursor += chunk_size;
             }
 
             size_t m = fft_analyze(1.0f/RENDER_FPS);
@@ -3283,6 +3321,8 @@ MUSIALIZER_PLUG void plug_init(void)
     assert(p != NULL && "Buy more RAM lol");
     memset(p, 0, sizeof(*p));
 
+    fft_buffer_init();
+
     load_assets();
     p->screen = LoadRenderTexture(RENDER_WIDTH, RENDER_HEIGHT);
     p->current_track = -1;
@@ -3338,6 +3378,7 @@ MUSIALIZER_PLUG void plug_shutdown(void)
 
     UnloadRenderTexture(p->screen);
     unload_assets();
+    fft_buffer_shutdown();
     free(p);
     p = NULL;
 }
@@ -3350,6 +3391,7 @@ MUSIALIZER_PLUG void *plug_pre_reload(void)
         Track *it = &p->tracks.items[i];
         DetachAudioStreamProcessor(it->music.stream, callback);
     }
+    fft_buffer_shutdown();
     unload_assets();
     return p;
 }
@@ -3357,6 +3399,7 @@ MUSIALIZER_PLUG void *plug_pre_reload(void)
 MUSIALIZER_PLUG void plug_post_reload(void *pp)
 {
     p = pp;
+    fft_buffer_init();
     memset(&loader, 0, sizeof(loader));
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Track *it = &p->tracks.items[i];

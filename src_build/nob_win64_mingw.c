@@ -23,6 +23,7 @@ bool build_musializer(void)
 #ifdef MUSIALIZER_HOTRELOAD
     cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
+    cmd_append(&cmd, "-O3", "-ffast-math", "-flto=auto");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
     cmd_append(&cmd, "-fPIC", "-shared");
@@ -41,6 +42,7 @@ bool build_musializer(void)
 
     cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
+    cmd_append(&cmd, "-O3", "-ffast-math", "-flto=auto");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
     cmd_append(&cmd, "-o", "./build/musializer");
@@ -63,6 +65,7 @@ bool build_musializer(void)
 #else
     cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
+    cmd_append(&cmd, "-O3", "-ffast-math", "-flto=auto");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
     cmd_append(&cmd, "-o", "./build/musializer");
@@ -113,9 +116,11 @@ bool build_raylib()
 
         da_append(&object_files, output_path);
 
-        if (needs_rebuild(output_path, &input_path, 1)) {
+        const char *inputs[] = {input_path, "./src_build/nob_win64_mingw.c"};
+        if (needs_rebuild(output_path, inputs, ARRAY_LEN(inputs))) {
             cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
             cmd_append(&cmd, "-ggdb", "-DPLATFORM_DESKTOP", "-fPIC", "-DSUPPORT_FILEFORMAT_FLAC=1");
+            cmd_append(&cmd, "-O3", "-ffast-math", "-flto=auto");
             cmd_append(&cmd, "-DPLATFORM_DESKTOP");
             cmd_append(&cmd, "-fPIC");
             cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER"external/glfw/include");
