@@ -14,7 +14,7 @@ bool build_musializer(void)
         "-I.", "-I"RAYLIB_SRC_FOLDER,
         "-fPIC", "-shared",
         "-o", "./build/libplug.so",
-        "./src/plug.c", "./src/ffmpeg_posix.c", "./thirdparty/tinyfiledialogs.c",
+        "./src/plug.c", "./src/platform_posix.c", "./src/ffmpeg_posix.c", "./thirdparty/tinyfiledialogs.c",
         temp_sprintf("-L./build/raylib/%s", MUSIALIZER_TARGET_NAME), "-l:libraylib.so",
         "-O3", "-march=native", "-ffast-math",
         "-lm", "-ldl", "-flto=auto", "-lpthread");
@@ -42,7 +42,7 @@ bool build_musializer(void)
         "-I.",
         "-I"RAYLIB_SRC_FOLDER,
         "-o", "./build/musializer",
-        "./src/plug.c", "./src/ffmpeg_posix.c", "./src/musializer.c", "./thirdparty/tinyfiledialogs.c",
+        "./src/plug.c", "./src/platform_posix.c", "./src/ffmpeg_posix.c", "./src/musializer.c", "./thirdparty/tinyfiledialogs.c",
         temp_sprintf("-L./build/raylib/%s", MUSIALIZER_TARGET_NAME), "-l:libraylib.a",
         "-O3", "-march=native", "-ffast-math",
         "-lm", "-ldl", "-flto=auto", "-lpthread");

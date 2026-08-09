@@ -22,6 +22,7 @@ bool build_musializer(void)
             nob_cmd_append(&cmd, "/I", RAYLIB_SRC_FOLDER);
             nob_cmd_append(&cmd,
                 "src/plug.c",
+                "src/platform_windows.c",
                 "src/ffmpeg_windows.c",
                 "./thirdparty/tinyfiledialogs.c");
             nob_cmd_append(&cmd,
@@ -58,6 +59,7 @@ bool build_musializer(void)
         nob_cmd_append(&cmd,
             "./src/musializer.c",
             "./src/plug.c",
+            "./src/platform_windows.c",
             "./src/ffmpeg_windows.c",
             "./thirdparty/tinyfiledialogs.c");
         nob_cmd_append(&cmd,

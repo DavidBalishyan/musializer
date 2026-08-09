@@ -21,7 +21,7 @@ bool build_musializer(void)
     if (!cmd_run(&cmd)) return_defer(false);
 
 #ifdef MUSIALIZER_HOTRELOAD
-    cmd_append(&cmd, "x86_64-w64-mingw32-gcc");
+    cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
@@ -30,6 +30,7 @@ bool build_musializer(void)
     cmd_append(&cmd, "-o", "./build/libplug.dll");
     cmd_append(&cmd,
         "./src/plug.c",
+        "./src/platform_windows.c",
         "./src/ffmpeg_windows.c",
         "./thirdparty/tinyfiledialogs.c");
     cmd_append(&cmd,
@@ -38,7 +39,7 @@ bool build_musializer(void)
     cmd_append(&cmd, "-lwinmm", "-lgdi32", "-lole32");
     if (!cmd_run(&cmd, .async = &procs)) return_defer(false);
 
-    cmd_append(&cmd, "x86_64-w64-mingw32-gcc");
+    cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
@@ -60,13 +61,14 @@ bool build_musializer(void)
 
     if (!procs_flush(&procs)) return_defer(false);
 #else
-    cmd_append(&cmd, "x86_64-w64-mingw32-gcc");
+    cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
     cmd_append(&cmd, "-mwindows", "-Wall", "-Wextra", "-ggdb");
     cmd_append(&cmd, "-I.");
     cmd_append(&cmd, "-I"RAYLIB_SRC_FOLDER);
     cmd_append(&cmd, "-o", "./build/musializer");
     cmd_append(&cmd,
         "./src/plug.c",
+        "./src/platform_windows.c",
         "./src/ffmpeg_windows.c",
         "./src/musializer.c",
         "./thirdparty/tinyfiledialogs.c",
@@ -112,7 +114,7 @@ bool build_raylib()
         da_append(&object_files, output_path);
 
         if (needs_rebuild(output_path, &input_path, 1)) {
-            cmd_append(&cmd, "x86_64-w64-mingw32-gcc");
+            cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
             cmd_append(&cmd, "-ggdb", "-DPLATFORM_DESKTOP", "-fPIC", "-DSUPPORT_FILEFORMAT_FLAC=1");
             cmd_append(&cmd, "-DPLATFORM_DESKTOP");
             cmd_append(&cmd, "-fPIC");
@@ -143,7 +145,7 @@ bool build_raylib()
     const char *libraylib_path = "./build/raylib.dll";
 
     if (needs_rebuild(libraylib_path, object_files.items, object_files.count)) {
-        cmd_append(&cmd, "x86_64-w64-mingw32-gcc");
+        cmd_append(&cmd, MAYBE_PREFIXED("gcc"));
         cmd_append(&cmd, "-shared");
         cmd_append(&cmd, "-o", libraylib_path);
         for (size_t i = 0; i < ARRAY_LEN(raylib_modules); ++i) {

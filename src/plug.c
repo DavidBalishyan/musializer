@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <complex.h>
@@ -9,13 +10,13 @@
 #include "build/config.h"
 #include "plug.h"
 #include "ffmpeg.h"
+#include "platform.h"
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
 // #define NOB_WARN_DEPRECATED
 #include "thirdparty/nob.h"
 #include "thirdparty/tinyfiledialogs.h"
 
-#include <pthread.h>
 #include <raylib.h>
 #include <rlgl.h>
 
@@ -111,6 +112,14 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 #define KEY_CAPTURE     KEY_C
 #define KEY_TOGGLE_MUTE KEY_M
 
+static char *duplicate_string(const char *text)
+{
+    size_t length = strlen(text) + 1;
+    char *result = malloc(length);
+    if (result != NULL) memcpy(result, text, length);
+    return result;
+}
+
 // Microsoft could not update their parser OMEGALUL:
 // https://learn.microsoft.com/en-us/cpp/c-runtime-library/complex-math-support?view=msvc-170#types-used-in-complex-math
 #ifdef _MSC_VER
@@ -134,6 +143,7 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 typedef struct {
     char *file_path;
     Music music;
+    unsigned char *music_data;
     Texture2D cover;
     bool has_cover;
 } Track;
@@ -746,13 +756,6 @@ static void popup_tray_push(Popup_Tray *pt, const char *message, bool success)
     }
 }
 
-static inline float signf(float x)
-{
-    if (x < 0.0) return -1;
-    if (x > 0.0) return 1;
-    return 0.0;
-}
-
 static void snap_segment_inside_other_segment(float ls, float rs, float *lt, float *rt)
 {
     float dt = *rt - *lt;
@@ -878,31 +881,120 @@ static void unload_preview_waveform(void)
     p->prev_track_index = -1;
 }
 
+#if defined(_WIN32)
+#define FFMPEG_EXECUTABLE "ffmpeg.exe"
+#else
+#define FFMPEG_EXECUTABLE "ffmpeg"
+#endif
+
+static bool convert_audio_with_ffmpeg(const char *source_path, const char *wav_path)
+{
+    const char *const argv[] = {
+        FFMPEG_EXECUTABLE,
+        "-nostdin", "-loglevel", "error", "-y",
+        "-i", source_path,
+        "-f", "wav", wav_path,
+        NULL,
+    };
+    return platform_run_command(argv, true);
+}
+
+static bool extract_cover_with_ffmpeg(const char *source_path, const char *cover_path)
+{
+    const char *const argv[] = {
+        FFMPEG_EXECUTABLE,
+        "-nostdin", "-loglevel", "error", "-y",
+        "-i", source_path,
+        "-an", "-frames:v", "1", cover_path,
+        NULL,
+    };
+    return platform_run_command(argv, true);
+}
+
+static Music load_music_from_memory_file(const char *file_path, unsigned char **music_data)
+{
+    Music music = {0};
+    unsigned char *data = NULL;
+    size_t size = 0;
+    if (!platform_read_entire_file(file_path, &data, &size) || size > INT_MAX) {
+        free(data);
+        return music;
+    }
+
+    music = LoadMusicStreamFromMemory(GetFileExtension(file_path), data, (int)size);
+    if (!IsMusicValid(music)) {
+        free(data);
+        return music;
+    }
+
+    *music_data = data;
+    return music;
+}
+
+static Music load_music_from_utf8_path(const char *file_path, unsigned char **music_data)
+{
+    *music_data = NULL;
+    Music music = LoadMusicStream(file_path);
+    if (IsMusicValid(music)) return music;
+    return load_music_from_memory_file(file_path, music_data);
+}
+
+static Wave load_wave_from_utf8_path(const char *file_path)
+{
+    Wave wave = LoadWave(file_path);
+    if (wave.frameCount > 0) return wave;
+
+    unsigned char *data = NULL;
+    size_t size = 0;
+    if (!platform_read_entire_file(file_path, &data, &size) || size > INT_MAX) {
+        free(data);
+        return wave;
+    }
+    wave = LoadWaveFromMemory(GetFileExtension(file_path), data, (int)size);
+    free(data);
+    return wave;
+}
+
+static Wave load_wave_with_ffmpeg_fallback(const char *file_path)
+{
+    Wave wave = load_wave_from_utf8_path(file_path);
+    if (wave.frameCount > 0) return wave;
+
+    char wav_path[4096] = {0};
+    if (platform_make_temp_file(wav_path, sizeof(wav_path), "musializer", ".wav")) {
+        if (convert_audio_with_ffmpeg(file_path, wav_path)) {
+            wave = load_wave_from_utf8_path(wav_path);
+        }
+        platform_remove_file(wav_path);
+    }
+    return wave;
+}
+
+static Image load_image_from_utf8_path(const char *file_path)
+{
+    Image image = LoadImage(file_path);
+    if (image.data != NULL) return image;
+
+    unsigned char *data = NULL;
+    size_t size = 0;
+    if (!platform_read_entire_file(file_path, &data, &size) || size > INT_MAX) {
+        free(data);
+        return image;
+    }
+    image = LoadImageFromMemory(GetFileExtension(file_path), data, (int)size);
+    free(data);
+    return image;
+}
+
 static void load_preview_waveform(const char *file_path)
 {
     unload_preview_waveform();
-    p->preview_wave = LoadWave(file_path);
+    p->preview_wave = load_wave_from_utf8_path(file_path);
 
     if (p->preview_wave.frameCount == 0) {
         // FFmpeg fallback for unsupported formats
-        char wav_path[1024];
-        {
-            const char *tmp_dir = "/tmp";
-#if defined(_WIN32)
-            tmp_dir = getenv("TEMP");
-            if (!tmp_dir) tmp_dir = ".";
-#endif
-            char tmp_path[1024];
-            snprintf(tmp_path, sizeof(tmp_path), "%s/musializer_XXXXXX", tmp_dir);
-            int fd = mkstemp(tmp_path);
-            if (fd != -1) {
-                close(fd);
-                snprintf(wav_path, sizeof(wav_path), "%s.wav", tmp_path);
-                remove(wav_path);
-                rename(tmp_path, wav_path);
-            }
-        }
-        if (wav_path[0]) {
+        char wav_path[4096] = {0};
+        if (platform_make_temp_file(wav_path, sizeof(wav_path), "musializer", ".wav")) {
             // Show loading indicator before blocking FFmpeg call
             {
                 const char *msg = "Loading waveform...";
@@ -913,16 +1005,14 @@ static void load_preview_waveform(const char *file_path)
                 BeginDrawing();
                 ClearBackground(COLOR_BACKGROUND);
             }
-            char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -f wav \"%s\" 2>/dev/null", file_path, wav_path);
-            if (system(cmd) == 0) {
-                Wave wave = LoadWave(wav_path);
+            if (convert_audio_with_ffmpeg(file_path, wav_path)) {
+                Wave wave = load_wave_from_utf8_path(wav_path);
                 if (wave.frameCount > 0) {
                     p->preview_wave = wave;
                     p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
                 }
             }
-            remove(wav_path);
+            platform_remove_file(wav_path);
         }
     } else {
         p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
@@ -1023,9 +1113,9 @@ typedef struct {
 } Load_Job;
 
 static struct {
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    Platform_Thread *thread;
+    Platform_Mutex *mutex;
+    Platform_Condition *condition;
     bool running;
     Load_Job *pending;
     size_t pending_count;
@@ -1033,7 +1123,6 @@ static struct {
     Load_Job *completed;
     size_t completed_count;
     size_t completed_cap;
-    size_t loading;
 } loader = {0};
 
 static void *loader_thread(void *arg)
@@ -1041,34 +1130,27 @@ static void *loader_thread(void *arg)
     (void)arg;
     while (1) {
         Load_Job job;
-        pthread_mutex_lock(&loader.mutex);
-        while (loader.pending_count == 0) {
-            if (!loader.running) {
-                pthread_mutex_unlock(&loader.mutex);
-                return NULL;
-            }
-            pthread_cond_wait(&loader.cond, &loader.mutex);
+        platform_mutex_lock(loader.mutex);
+        while (loader.pending_count == 0 && loader.running) {
+            platform_condition_wait(loader.condition, loader.mutex);
+        }
+        if (!loader.running) {
+            platform_mutex_unlock(loader.mutex);
+            return NULL;
         }
         job = loader.pending[0];
         memmove(loader.pending, loader.pending + 1, (loader.pending_count - 1) * sizeof(Load_Job));
         loader.pending_count--;
-        pthread_mutex_unlock(&loader.mutex);
+        platform_mutex_unlock(loader.mutex);
 
         // Process: FFmpeg conversion
         if (job.need_conversion) {
-            char tmp_path[1024];
-            snprintf(tmp_path, sizeof(tmp_path), "/tmp/musializer_XXXXXX");
-            int fd = mkstemp(tmp_path);
-            if (fd == -1) { job.failed = true; goto done; }
-            close(fd);
-            snprintf(job.wav_path, sizeof(job.wav_path), "%s.wav", tmp_path);
-            remove(job.wav_path);
-            rename(tmp_path, job.wav_path);
-
-            char cmd[4096];
-            snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -f wav \"%s\" 2>/dev/null", job.source_path, job.wav_path);
-            if (system(cmd) != 0) {
-                remove(job.wav_path);
+            if (!platform_make_temp_file(job.wav_path, sizeof(job.wav_path), "musializer", ".wav")) {
+                job.failed = true;
+                goto done;
+            }
+            if (!convert_audio_with_ffmpeg(job.source_path, job.wav_path)) {
+                platform_remove_file(job.wav_path);
                 job.wav_path[0] = '\0';
                 job.failed = true;
                 goto done;
@@ -1077,49 +1159,54 @@ static void *loader_thread(void *arg)
 
         // Process: cover extraction
         if (job.need_cover && !job.failed) {
-            char tmp_cov[1024];
-            snprintf(tmp_cov, sizeof(tmp_cov), "/tmp/musializer_cover_XXXXXX");
-            int fd = mkstemp(tmp_cov);
-            if (fd != -1) {
-                close(fd);
-                snprintf(job.cover_path, sizeof(job.cover_path), "%s.jpg", tmp_cov);
-                remove(job.cover_path);
-                rename(tmp_cov, job.cover_path);
-
-                char cmd[4096];
-                snprintf(cmd, sizeof(cmd), "ffmpeg -nostdin -y -i \"%s\" -an -frames:v 1 \"%s\" 2>/dev/null", job.source_path, job.cover_path);
-                if (system(cmd) == 0) {
+            if (platform_make_temp_file(job.cover_path, sizeof(job.cover_path), "musializer_cover", ".jpg")) {
+                if (extract_cover_with_ffmpeg(job.source_path, job.cover_path)) {
                     job.has_cover = true;
                 } else {
-                    remove(job.cover_path);
+                    platform_remove_file(job.cover_path);
                     job.cover_path[0] = '\0';
                 }
             }
         }
 
     done:
-        pthread_mutex_lock(&loader.mutex);
+        platform_mutex_lock(loader.mutex);
         if (loader.completed_count >= loader.completed_cap) {
             loader.completed_cap = loader.completed_cap ? loader.completed_cap * 2 : 8;
             loader.completed = realloc(loader.completed, loader.completed_cap * sizeof(Load_Job));
             assert(loader.completed != NULL);
         }
         loader.completed[loader.completed_count++] = job;
-        pthread_mutex_unlock(&loader.mutex);
+        platform_mutex_unlock(loader.mutex);
     }
 }
 
-static void loader_init(void)
+static bool loader_init(void)
 {
-    pthread_mutex_init(&loader.mutex, NULL);
-    pthread_cond_init(&loader.cond, NULL);
+    loader.mutex = platform_mutex_create();
+    loader.condition = platform_condition_create();
+    if (loader.mutex == NULL || loader.condition == NULL) goto fail;
+
     loader.running = true;
-    pthread_create(&loader.thread, NULL, loader_thread, NULL);
+    loader.thread = platform_thread_start(loader_thread, NULL);
+    if (loader.thread == NULL) goto fail;
+    return true;
+
+fail:
+    loader.running = false;
+    platform_condition_destroy(loader.condition);
+    platform_mutex_destroy(loader.mutex);
+    loader.condition = NULL;
+    loader.mutex = NULL;
+    return false;
 }
 
 static void enqueue_load_job(const char *file_path, bool need_conversion)
 {
-    if (!loader.running) loader_init();
+    if (!loader.running && !loader_init()) {
+        popup_tray_push(&p->pt, "Could not start file loader", false);
+        return;
+    }
 
     Load_Job job = {0};
     strncpy(job.source_path, file_path, sizeof(job.source_path) - 1);
@@ -1127,21 +1214,20 @@ static void enqueue_load_job(const char *file_path, bool need_conversion)
     job.need_cover = true;
     job.target_track = -1;
 
-    pthread_mutex_lock(&loader.mutex);
+    platform_mutex_lock(loader.mutex);
     if (loader.pending_count >= loader.pending_cap) {
         loader.pending_cap = loader.pending_cap ? loader.pending_cap * 2 : 8;
         loader.pending = realloc(loader.pending, loader.pending_cap * sizeof(Load_Job));
         assert(loader.pending != NULL);
     }
     loader.pending[loader.pending_count++] = job;
-    loader.loading++;
-    pthread_mutex_unlock(&loader.mutex);
-    pthread_cond_signal(&loader.cond);
+    platform_mutex_unlock(loader.mutex);
+    platform_condition_signal(loader.condition);
 }
 
 static void enqueue_cover_job(const char *file_path, int track_index)
 {
-    if (!loader.running) loader_init();
+    if (!loader.running && !loader_init()) return;
 
     Load_Job job = {0};
     strncpy(job.source_path, file_path, sizeof(job.source_path) - 1);
@@ -1149,52 +1235,71 @@ static void enqueue_cover_job(const char *file_path, int track_index)
     job.need_cover = true;
     job.target_track = track_index;
 
-    pthread_mutex_lock(&loader.mutex);
+    platform_mutex_lock(loader.mutex);
     if (loader.pending_count >= loader.pending_cap) {
         loader.pending_cap = loader.pending_cap ? loader.pending_cap * 2 : 8;
         loader.pending = realloc(loader.pending, loader.pending_cap * sizeof(Load_Job));
         assert(loader.pending != NULL);
     }
     loader.pending[loader.pending_count++] = job;
-    loader.loading++;
-    pthread_mutex_unlock(&loader.mutex);
-    pthread_cond_signal(&loader.cond);
+    platform_mutex_unlock(loader.mutex);
+    platform_condition_signal(loader.condition);
 }
 
 static void process_completed_loads(void)
 {
-    if (loader.completed_count == 0) return;
+    if (!loader.running) return;
 
-    pthread_mutex_lock(&loader.mutex);
+    platform_mutex_lock(loader.mutex);
     size_t n = loader.completed_count;
+    Load_Job *completed = loader.completed;
+    loader.completed = NULL;
+    loader.completed_count = 0;
+    loader.completed_cap = 0;
+    platform_mutex_unlock(loader.mutex);
+
     for (size_t i = 0; i < n; i++) {
-        Load_Job *job = &loader.completed[i];
+        Load_Job *job = &completed[i];
         if (job->target_track >= 0) {
             // Cover-only job: apply cover to existing track
-            if (!job->failed && job->has_cover && (size_t)job->target_track < p->tracks.count) {
-                Image img = LoadImage(job->cover_path);
+            ptrdiff_t target_track = -1;
+            if ((size_t)job->target_track < p->tracks.count &&
+                strcmp(p->tracks.items[job->target_track].file_path, job->source_path) == 0) {
+                target_track = job->target_track;
+            } else {
+                // A track can be reordered or removed while FFmpeg is working.
+                for (size_t track_index = 0; track_index < p->tracks.count; ++track_index) {
+                    if (strcmp(p->tracks.items[track_index].file_path, job->source_path) == 0) {
+                        target_track = (ptrdiff_t)track_index;
+                        break;
+                    }
+                }
+            }
+            if (!job->failed && job->has_cover && target_track >= 0) {
+                Image img = load_image_from_utf8_path(job->cover_path);
                 if (img.data != NULL) {
-                    p->tracks.items[job->target_track].cover = LoadTextureFromImage(img);
-                    p->tracks.items[job->target_track].has_cover = true;
+                    p->tracks.items[target_track].cover = LoadTextureFromImage(img);
+                    p->tracks.items[target_track].has_cover = true;
                     UnloadImage(img);
                 }
             }
-            if (job->cover_path[0]) remove(job->cover_path);
+            if (job->cover_path[0]) platform_remove_file(job->cover_path);
         } else if (!job->failed) {
             // Full job: create new track
             Music music = {0};
+            unsigned char *music_data = NULL;
             if (job->wav_path[0]) {
-                music = LoadMusicStream(job->wav_path);
+                music = load_music_from_memory_file(job->wav_path, &music_data);
             }
             if (IsMusicValid(music)) {
                 music.looping = false;
                 AttachAudioStreamProcessor(music.stream, callback);
-                char *path = strdup(job->source_path);
+                char *path = duplicate_string(job->source_path);
                 assert(path != NULL);
-                Track track = { .file_path = path, .music = music, .has_cover = false };
+                Track track = { .file_path = path, .music = music, .music_data = music_data, .has_cover = false };
                 nob_da_append(&p->tracks, track);
                 if (job->has_cover && job->cover_path[0]) {
-                    Image img = LoadImage(job->cover_path);
+                    Image img = load_image_from_utf8_path(job->cover_path);
                     if (img.data != NULL) {
                         p->tracks.items[p->tracks.count - 1].cover = LoadTextureFromImage(img);
                         p->tracks.items[p->tracks.count - 1].has_cover = true;
@@ -1207,35 +1312,40 @@ static void process_completed_loads(void)
                 }
                 popup_tray_push(&p->pt, "Track loaded", true);
             } else {
+                free(music_data);
                 popup_tray_push(&p->pt, "Could not load track", false);
             }
-            if (job->wav_path[0]) remove(job->wav_path);
-            if (job->cover_path[0]) remove(job->cover_path);
+            if (job->wav_path[0]) platform_remove_file(job->wav_path);
+            if (job->cover_path[0]) platform_remove_file(job->cover_path);
         } else {
             popup_tray_push(&p->pt, "Failed to convert file", false);
         }
-        loader.loading--;
     }
-    loader.completed_count = 0;
-    pthread_mutex_unlock(&loader.mutex);
+    free(completed);
 }
 
 static void loader_stop(void)
 {
     if (!loader.running) return;
-    pthread_mutex_lock(&loader.mutex);
+    platform_mutex_lock(loader.mutex);
     loader.running = false;
-    pthread_cond_broadcast(&loader.cond);
-    pthread_mutex_unlock(&loader.mutex);
-    pthread_join(loader.thread, NULL);
+    platform_condition_broadcast(loader.condition);
+    platform_mutex_unlock(loader.mutex);
+    platform_thread_join(loader.thread);
+
+    for (size_t i = 0; i < loader.pending_count; ++i) {
+        platform_remove_file(loader.pending[i].wav_path);
+        platform_remove_file(loader.pending[i].cover_path);
+    }
+    for (size_t i = 0; i < loader.completed_count; ++i) {
+        platform_remove_file(loader.completed[i].wav_path);
+        platform_remove_file(loader.completed[i].cover_path);
+    }
     free(loader.pending);
     free(loader.completed);
-    loader.pending = NULL;
-    loader.completed = NULL;
-    loader.pending_count = loader.pending_cap = 0;
-    loader.completed_count = loader.completed_cap = 0;
-    pthread_mutex_destroy(&loader.mutex);
-    pthread_cond_destroy(&loader.cond);
+    platform_condition_destroy(loader.condition);
+    platform_mutex_destroy(loader.mutex);
+    memset(&loader, 0, sizeof(loader));
 }
 // ----------------------------------------------------------------------------
 
@@ -1247,15 +1357,17 @@ static void load_track_from_path(const char *file_path)
     }
 
     // Try native raylib load first (fast, on main thread)
-    Music music = LoadMusicStream(file_path);
+    unsigned char *music_data = NULL;
+    Music music = load_music_from_utf8_path(file_path, &music_data);
     if (IsMusicValid(music)) {
         music.looping = false;
         AttachAudioStreamProcessor(music.stream, callback);
-        char *path = strdup(file_path);
+        char *path = duplicate_string(file_path);
         assert(path != NULL);
         nob_da_append(&p->tracks, (CLITERAL(Track){
             .file_path = path,
             .music = music,
+            .music_data = music_data,
             .has_cover = false,
         }));
         // Extract cover art in background thread
@@ -1269,7 +1381,7 @@ static void load_track_from_path(const char *file_path)
 
 static void load_m3u_playlist(const char *file_path)
 {
-    FILE *f = fopen(file_path, "r");
+    FILE *f = platform_fopen(file_path, "r");
     if (!f) {
         popup_tray_push(&p->pt, "Could not open playlist", false);
         return;
@@ -1307,7 +1419,6 @@ static void open_files_dialog(void)
         "audio files",
         1);
     if (!result) return;
-    char *save = result;
     while (*result) {
         char *next = strchr(result, '|');
         if (next) *next = '\0';
@@ -1320,7 +1431,6 @@ static void open_files_dialog(void)
         if (!next) break;
         result = next + 1;
     }
-    free(save);
     startup_autoplay();
 }
 
@@ -1549,7 +1659,7 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
     }
 
     // Drag-and-drop state
-    static ssize_t drag_from = -1;
+    static ptrdiff_t drag_from = -1;
     static float drag_start_mouse_y = 0;
     static bool is_dragging = false;
 
@@ -1558,9 +1668,9 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
         if (is_dragging) {
             size_t from = (size_t)drag_from;
             float list_y = mouse.y - panel_boundary.y + panel_scroll - item_size*0.1f;
-            ssize_t raw_target = (ssize_t)(list_y / item_size);
+            ptrdiff_t raw_target = (ptrdiff_t)(list_y / item_size);
             if (raw_target < 0) raw_target = 0;
-            if ((size_t)raw_target > p->tracks.count) raw_target = (ssize_t)p->tracks.count;
+            if ((size_t)raw_target > p->tracks.count) raw_target = (ptrdiff_t)p->tracks.count;
             size_t to = (size_t)raw_target;
 
             if (from < to) to--;
@@ -1602,8 +1712,8 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
     id = djb2(id, file, strlen(file));
     id = djb2(id, &line, sizeof(line));
 
-    ssize_t remove_index = -1;
-    ssize_t move_from = -1;
+    ptrdiff_t remove_index = -1;
+    ptrdiff_t move_from = -1;
 
     for (size_t i = 0; i < p->tracks.count; ++i) {
         Rectangle item_boundary = {
@@ -1641,19 +1751,19 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
                 Rectangle btn = { bx, by, bsize, bsize };
                 uint64_t bid = djb2(item_id, "up", 2);
                 action_bs_up = button_with_id(bid, btn);
-                if (action_bs_up & BS_CLICKED) move_from = (ssize_t)i;
+                if (action_bs_up & BS_CLICKED) move_from = (ptrdiff_t)i;
             }
             if (i + 1 < p->tracks.count) {
                 Rectangle btn = { bx + bsize, by, bsize, bsize };
                 uint64_t bid = djb2(item_id, "dn", 2);
                 action_bs_dn = button_with_id(bid, btn);
-                if (action_bs_dn & BS_CLICKED) move_from = (ssize_t)i + 1;
+                if (action_bs_dn & BS_CLICKED) move_from = (ptrdiff_t)i + 1;
             }
             {
                 Rectangle btn = { bx + bsize * 2, by, bsize, bsize };
                 uint64_t bid = djb2(item_id, "rm", 2);
                 action_bs_rm = button_with_id(bid, btn);
-                if (action_bs_rm & BS_CLICKED) remove_index = (ssize_t)i;
+                if (action_bs_rm & BS_CLICKED) remove_index = (ptrdiff_t)i;
             }
         }
 
@@ -1669,7 +1779,7 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
                 on_action_btn = on_action_btn || CheckCollisionPointRec(mouse, (Rectangle){dbx + dbsize * 2.f, dby, dbsize, dbsize});
             }
             if (!on_action_btn) {
-                drag_from = (ssize_t)i;
+                drag_from = (ptrdiff_t)i;
                 drag_start_mouse_y = mouse.y;
             }
         }
@@ -1690,7 +1800,7 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
             play_track((int)i);
         }
 
-        if (is_dragging && drag_from == (ssize_t)i) continue;
+        if (is_dragging && drag_from == (ptrdiff_t)i) continue;
 
         DrawRectangleRounded(item_boundary, 0.2, 20, color);
 
@@ -1813,9 +1923,9 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
         }
         if (is_dragging) {
             float list_y = mouse.y - (panel_boundary.y + panel_padding - panel_scroll);
-            ssize_t zone = (ssize_t)(list_y / item_size + 0.5f);
+            ptrdiff_t zone = (ptrdiff_t)(list_y / item_size + 0.5f);
             if (zone < 0) zone = 0;
-            if ((size_t)zone > p->tracks.count) zone = (ssize_t)p->tracks.count;
+            if ((size_t)zone > p->tracks.count) zone = (ptrdiff_t)p->tracks.count;
             if (zone == drag_from || zone == drag_from + 1) zone = -1;
 
             // Auto-scroll when near panel edges
@@ -1887,6 +1997,7 @@ static void tracks_panel_with_location(const char *file, int line, Rectangle pan
 
         if (was_current) StopMusicStream(t->music);
         UnloadMusicStream(t->music);
+        free(t->music_data);
         free(t->file_path);
         memmove(&p->tracks.items[remove_index], &p->tracks.items[remove_index + 1],
                 (p->tracks.count - (size_t)remove_index - 1) * sizeof(Track));
@@ -2369,13 +2480,24 @@ static void start_rendering_track(Track *track)
     char *output_path = tinyfd_saveFileDialog("Path to rendered video", "./", NOB_ARRAY_LEN(filter_params), filter_params, "mp4 video file");
     if (output_path == NULL) return;
 
-    StopMusicStream(track->music);
-
-    fft_clean();
     // TODO: LoadWave is pretty slow on big files
-    p->wave = LoadWave(track->file_path);
+    Wave wave = load_wave_with_ffmpeg_fallback(track->file_path);
+    if (wave.frameCount == 0) {
+        popup_tray_push(&p->pt, "Could not decode track for rendering", false);
+        return;
+    }
+    float *wave_samples = LoadWaveSamples(wave);
+    if (wave_samples == NULL) {
+        UnloadWave(wave);
+        popup_tray_push(&p->pt, "Could not decode track for rendering", false);
+        return;
+    }
+
+    StopMusicStream(track->music);
+    fft_clean();
+    p->wave = wave;
     p->wave_cursor = 0;
-    p->wave_samples = LoadWaveSamples(p->wave);
+    p->wave_samples = wave_samples;
     // TODO: set the rendering output path based on the input path
     // Basically output into the same folder
     p->ffmpeg = ffmpeg_start_rendering(output_path, p->screen.texture.width, p->screen.texture.height, RENDER_FPS, track->file_path);
@@ -2389,7 +2511,9 @@ static void finish_rendering_track(Track *track)
 {
     SetTraceLogLevel(LOG_INFO);
     UnloadWave(p->wave);
+    memset(&p->wave, 0, sizeof(p->wave));
     UnloadWaveSamples(p->wave_samples);
+    p->wave_samples = NULL;
     SetTargetFPS(PREVIEW_FPS);
     p->rendering = false;
     fft_clean();
@@ -2552,7 +2676,7 @@ static bool toolbar(Track *track, Rectangle boundary)
         interacted = true;
         const char *save_path = tinyfd_saveFileDialog("Save Playlist", "playlist.m3u", 1, (const char *[]){ "*.m3u", "*.m3u8" }, "M3U Playlist");
         if (save_path) {
-            FILE *f = fopen(save_path, "w");
+            FILE *f = platform_fopen(save_path, "w");
             if (f) {
                 for (size_t i = 0; i < p->tracks.count; i++) {
                     fprintf(f, "%s\n", p->tracks.items[i].file_path);
@@ -2907,11 +3031,12 @@ static void capture_screen(void)
             if (IsMusicValid(music)) {
                 music.looping = false;
                 AttachAudioStreamProcessor(music.stream, callback);
-                char *file_path = strdup(recording_file_path);
+                char *file_path = duplicate_string(recording_file_path);
                 assert(file_path != NULL);
                 nob_da_append(&p->tracks, (CLITERAL(Track) {
                     .file_path = file_path,
                     .music = music,
+                    .music_data = NULL,
                 }));
             } else {
                 popup_tray_push(&p->pt, "Could not load capture", false);
@@ -3171,6 +3296,50 @@ MUSIALIZER_PLUG void plug_init(void)
     p->crossfade_duration = 3.0f;
     p->track_was_playing = false;
     SetTargetFPS(PREVIEW_FPS);
+}
+
+MUSIALIZER_PLUG void plug_shutdown(void)
+{
+    if (p == NULL) return;
+
+    loader_stop();
+    unload_preview_waveform();
+
+    if (p->ffmpeg != NULL) {
+        ffmpeg_end_rendering(p->ffmpeg, true);
+        p->ffmpeg = NULL;
+    }
+    if (p->wave_samples != NULL) {
+        UnloadWaveSamples(p->wave_samples);
+        p->wave_samples = NULL;
+    }
+    if (p->wave.frameCount > 0) {
+        UnloadWave(p->wave);
+        memset(&p->wave, 0, sizeof(p->wave));
+    }
+
+#ifdef MUSIALIZER_MICROPHONE
+    if (p->microphone_working) {
+        ma_device_uninit(&p->microphone);
+        drwav_uninit(&p->wav);
+        p->microphone_working = false;
+    }
+#endif
+
+    for (size_t i = 0; i < p->tracks.count; ++i) {
+        Track *track = &p->tracks.items[i];
+        DetachAudioStreamProcessor(track->music.stream, callback);
+        UnloadMusicStream(track->music);
+        free(track->music_data);
+        if (track->has_cover) UnloadTexture(track->cover);
+        free(track->file_path);
+    }
+    free(p->tracks.items);
+
+    UnloadRenderTexture(p->screen);
+    unload_assets();
+    free(p);
+    p = NULL;
 }
 
 MUSIALIZER_PLUG void *plug_pre_reload(void)
