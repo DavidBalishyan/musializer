@@ -42,6 +42,9 @@ int main(int argc, char **argv)
     platform_mutex_unlock(state.mutex);
     platform_thread_join(thread);
 
+    assert(platform_mutex_try_lock(state.mutex));
+    platform_mutex_unlock(state.mutex);
+
     platform_condition_destroy(state.condition);
     platform_mutex_destroy(state.mutex);
 

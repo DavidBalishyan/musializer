@@ -45,6 +45,11 @@ void platform_mutex_lock(Platform_Mutex *mutex)
     pthread_mutex_lock(&mutex->value);
 }
 
+bool platform_mutex_try_lock(Platform_Mutex *mutex)
+{
+    return pthread_mutex_trylock(&mutex->value) == 0;
+}
+
 void platform_mutex_unlock(Platform_Mutex *mutex)
 {
     pthread_mutex_unlock(&mutex->value);

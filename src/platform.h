@@ -14,6 +14,7 @@ typedef void *(*Platform_Thread_Function)(void *arg);
 Platform_Mutex *platform_mutex_create(void);
 void platform_mutex_destroy(Platform_Mutex *mutex);
 void platform_mutex_lock(Platform_Mutex *mutex);
+bool platform_mutex_try_lock(Platform_Mutex *mutex);
 void platform_mutex_unlock(Platform_Mutex *mutex);
 
 Platform_Condition *platform_condition_create(void);

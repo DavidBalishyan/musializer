@@ -45,6 +45,11 @@ void platform_mutex_lock(Platform_Mutex *mutex)
     EnterCriticalSection(&mutex->value);
 }
 
+bool platform_mutex_try_lock(Platform_Mutex *mutex)
+{
+    return TryEnterCriticalSection(&mutex->value) != 0;
+}
+
 void platform_mutex_unlock(Platform_Mutex *mutex)
 {
     LeaveCriticalSection(&mutex->value);

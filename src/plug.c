@@ -72,6 +72,11 @@ MUSIALIZER_PLUG void *plug_load_resource(const char *file_path, size_t *size)
 #define GLSL_VERSION 330
 
 #define FFT_SIZE (1<<13)
+#define FFT_LOG_STEP 1.06f
+#define WAVEFORM_CACHE_BINS 4096
+#define EQ_LOW_FC 300.0f
+#define EQ_HIGH_FC 8000.0f
+#define EQ_SAMPLE_RATE 44100.0f
 #define FONT_SIZE 48
 
 #define PREVIEW_FPS 60
@@ -172,6 +177,11 @@ typedef struct {
     bool success;
 } Popup;
 
+typedef struct {
+    float min;
+    float max;
+} Waveform_Peak;
+
 #define PT_GET(pt, index) (assert(index < (pt)->count), &(pt)->items[((pt)->begin + index)%POPUP_TRAY_CAPACITY])
 #define PT_FIRST(pt) PT_GET((pt), 0)
 #define PT_LAST(pt) PT_GET((pt), (pt)->count - 1)
@@ -235,12 +245,13 @@ typedef struct {
     bool cancel_rendering;
 
     // Waveform Preview
-    int prev_track_index;
-    Wave preview_wave;
-    float *preview_wave_samples;
+    char *preview_waveform_path;
+    Waveform_Peak *preview_waveform;
+    size_t preview_waveform_count;
 
     // FFT Analyzer
     float in_raw[FFT_SIZE];
+    size_t fft_write_cursor;
     float in_win[FFT_SIZE];
     Float_Complex out_raw[FFT_SIZE];
     float out_log[FFT_SIZE];
@@ -307,14 +318,69 @@ typedef struct {
 static Plug *p = NULL;
 static Platform_Mutex *fft_mutex = NULL;
 static float fft_hann_window[FFT_SIZE];
+static size_t fft_bit_reverse[FFT_SIZE];
+static Float_Complex fft_twiddles[FFT_SIZE/2];
+static struct {
+    size_t begin;
+    size_t end;
+} fft_log_bins[FFT_SIZE/2];
+static size_t fft_log_bin_count;
+static Color fft_colors[FFT_SIZE/2];
+static Color fft_colors_dim[FFT_SIZE/2];
+static float fft_circle_x[FFT_SIZE/2];
+static float fft_circle_y[FFT_SIZE/2];
+static float eq_alpha_low;
+static float eq_alpha_high;
 
 static void fft_buffer_init(void)
 {
     fft_mutex = platform_mutex_create();
     assert(fft_mutex != NULL && "Could not create FFT mutex");
+    eq_alpha_low = 1.0f - expf(-2.0f*PI*EQ_LOW_FC/EQ_SAMPLE_RATE);
+    eq_alpha_high = 1.0f - expf(-2.0f*PI*EQ_HIGH_FC/EQ_SAMPLE_RATE);
+
     for (size_t i = 0; i < FFT_SIZE; ++i) {
         float t = (float)i/(FFT_SIZE - 1);
         fft_hann_window[i] = 0.5f - 0.5f*cosf(2*PI*t);
+    }
+
+    size_t reversed = 0;
+    for (size_t i = 0; i < FFT_SIZE; ++i) {
+        fft_bit_reverse[i] = reversed;
+        if (i + 1 < FFT_SIZE) {
+            size_t bit = FFT_SIZE >> 1;
+            while (reversed & bit) {
+                reversed ^= bit;
+                bit >>= 1;
+            }
+            reversed ^= bit;
+        }
+    }
+
+    for (size_t i = 0; i < FFT_SIZE/2; ++i) {
+        float angle = 2.0f*PI*(float)i/FFT_SIZE;
+        fft_twiddles[i] = cbuild(cosf(angle), sinf(angle));
+    }
+
+    fft_log_bin_count = 0;
+    for (float f = 1.0f; (size_t)f < FFT_SIZE/2; f = ceilf(f*FFT_LOG_STEP)) {
+        size_t begin = (size_t)f;
+        size_t end = (size_t)ceilf(f*FFT_LOG_STEP);
+        if (end > FFT_SIZE/2) end = FFT_SIZE/2;
+        fft_log_bins[fft_log_bin_count].begin = begin;
+        fft_log_bins[fft_log_bin_count].end = end;
+        fft_log_bin_count++;
+    }
+
+    // The exact bin count depends on FFT_SIZE and FFT_LOG_STEP. Build stable
+    // render data once so the frame loop does not repeat color and trig work.
+    for (size_t i = 0; i < fft_log_bin_count; ++i) {
+        float hue = 360.0f*(float)i/fft_log_bin_count;
+        float angle = 2.0f*PI*(float)i/fft_log_bin_count - PI/2.0f;
+        fft_colors[i] = ColorFromHSV(hue, 0.75f, 1.0f);
+        fft_colors_dim[i] = ColorFromHSV(hue, 0.75f, 0.5f);
+        fft_circle_x[i] = cosf(angle);
+        fft_circle_y[i] = sinf(angle);
     }
 }
 
@@ -327,7 +393,7 @@ static void fft_buffer_shutdown(void)
 static bool fft_settled(void)
 {
     float eps = 1e-3;
-    for (size_t i = 0; i < FFT_SIZE; ++i) {
+    for (size_t i = 0; i < fft_log_bin_count; ++i) {
         if (p->out_smooth[i] > eps) return false;
         if (p->out_smear[i] > eps) return false;
     }
@@ -338,6 +404,7 @@ static void fft_clean(void)
 {
     platform_mutex_lock(fft_mutex);
     memset(p->in_raw, 0, sizeof(p->in_raw));
+    p->fft_write_cursor = 0;
     platform_mutex_unlock(fft_mutex);
     memset(p->in_win, 0, sizeof(p->in_win));
     memset(p->out_raw, 0, sizeof(p->out_raw));
@@ -347,50 +414,41 @@ static void fft_clean(void)
 }
 
 // Ported from https://cp-algorithms.com/algebra/fft.html
-static void fft(float in[], Float_Complex out[], size_t n)
+static void fft(const float in[], Float_Complex out[], size_t n)
 {
+    assert(n == FFT_SIZE);
     for(size_t i = 0; i < n; i++) {
-        out[i] = cfromreal(in[i]);
-    }
-
-    for (size_t i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            Float_Complex temp = out[i];
-            out[i] = out[j];
-            out[j] = temp;
-        }
+        out[fft_bit_reverse[i]] = cfromreal(in[i]);
     }
 
     for (size_t len = 2; len <= n; len <<= 1) {
-        float ang = 2 * PI / len;
-        Float_Complex wlen = cbuild(cosf(ang), sinf(ang));
+        size_t twiddle_step = n/len;
         for (size_t i = 0; i < n; i += len) {
-            Float_Complex w = cfromreal(1);
             for (size_t j = 0; j < len / 2; j++) {
+                Float_Complex w = fft_twiddles[j*twiddle_step];
                 Float_Complex u = out[i+j], v = mulcc(out[i+j+len/2], w);
                 out[i+j] = addcc(u, v);
                 out[i+j+len/2] = subcc(u, v);
-                w = mulcc(w, wlen);
             }
         }
     }
 }
 
-static inline float amp(Float_Complex z)
+static inline float power(Float_Complex z)
 {
     float a = crealf(z);
     float b = cimagf(z);
-    return logf(a*a + b*b);
+    return a*a + b*b;
 }
 
 static size_t fft_analyze(float dt)
 {
     // Snapshot the audio-thread input, then release it before doing analyzer work.
     platform_mutex_lock(fft_mutex);
-    memcpy(p->in_win, p->in_raw, sizeof(p->in_win));
+    size_t cursor = p->fft_write_cursor;
+    size_t tail = FFT_SIZE - cursor;
+    memcpy(p->in_win, p->in_raw + cursor, tail*sizeof(p->in_win[0]));
+    memcpy(p->in_win + tail, p->in_raw, cursor*sizeof(p->in_win[0]));
     platform_mutex_unlock(fft_mutex);
 
     // Apply the Hann Window on the Input - https://en.wikipedia.org/wiki/Hann_function
@@ -402,19 +460,17 @@ static size_t fft_analyze(float dt)
     fft(p->in_win, p->out_raw, FFT_SIZE);
 
     // "Squash" into the Logarithmic Scale
-    float step = 1.06;
-    float lowf = 1.0f;
-    size_t m = 0;
+    size_t m = fft_log_bin_count;
     float max_amp = 1.0f;
-    for (float f = lowf; (size_t) f < FFT_SIZE/2; f = ceilf(f*step)) {
-        float f1 = ceilf(f*step);
-        float a = 0.0f;
-        for (size_t q = (size_t) f; q < FFT_SIZE/2 && q < (size_t) f1; ++q) {
-            float b = amp(p->out_raw[q]);
-            if (b > a) a = b;
+    for (size_t i = 0; i < m; ++i) {
+        float max_power = 1.0f;
+        for (size_t q = fft_log_bins[i].begin; q < fft_log_bins[i].end; ++q) {
+            float value = power(p->out_raw[q]);
+            if (value > max_power) max_power = value;
         }
+        float a = logf(max_power);
         if (max_amp < a) max_amp = a;
-        p->out_log[m++] = a;
+        p->out_log[i] = a;
     }
 
     // Normalize Frequencies to 0..1 range
@@ -438,11 +494,12 @@ static size_t fft_analyze(float dt)
     }
 
     // Smooth out and smear the values
+    float fast_decay = expf(-8.0f*dt);
+    float smoothness = 1.0f - fast_decay;
+    float smearness = 1.0f - expf(-3.0f*dt);
     for (size_t i = 0; i < m; ++i) {
-        float smoothness = 8;
-        p->out_smooth[i] += (p->out_log[i] - p->out_smooth[i])*smoothness*dt;
-        float smearness = 3;
-        p->out_smear[i] += (p->out_smooth[i] - p->out_smear[i])*smearness*dt;
+        p->out_smooth[i] += (p->out_log[i] - p->out_smooth[i])*smoothness;
+        p->out_smear[i] += (p->out_smooth[i] - p->out_smear[i])*smearness;
     }
 
     // Beat Detection
@@ -468,8 +525,7 @@ static size_t fft_analyze(float dt)
             p->beat_detected = false;
         }
 
-        float beat_decay = 8.0f;
-        p->beat_intensity += (0.0f - p->beat_intensity) * beat_decay * dt;
+        p->beat_intensity *= fast_decay;
         if (p->beat_detected) p->beat_intensity = 1.0f;
     }
 
@@ -500,18 +556,12 @@ static void fft_render_circular(Rectangle boundary, size_t m)
     float cx = boundary.x + boundary.width / 2;
     float cy = boundary.y + boundary.height / 2;
     float max_radius = (boundary.width < boundary.height ? boundary.width : boundary.height) * 0.4f;
-    float saturation = 0.75f;
-    float value = 1.0f;
-
-    float angle_step = 2.0f * PI / m;
     for (size_t i = 0; i < m; ++i) {
         float t = p->out_smooth[i];
-        float hue = (float)i / m * 360;
-        Color color = ColorFromHSV(hue, saturation, value);
+        Color color = fft_colors[i];
         float r = max_radius * (0.3f + 0.7f * t);
-        float a = angle_step * i - PI / 2;
-        float px = cx + cosf(a) * r;
-        float py = cy + sinf(a) * r;
+        float px = cx + fft_circle_x[i] * r;
+        float py = cy + fft_circle_y[i] * r;
         DrawCircleV((Vector2){px, py}, max_radius * 0.03f + max_radius * 0.05f * t, color);
         DrawLineEx((Vector2){cx, cy}, (Vector2){px, py}, max_radius * 0.02f * t, ColorAlpha(color, 0.3f));
     }
@@ -520,15 +570,12 @@ static void fft_render_circular(Rectangle boundary, size_t m)
 static void fft_render_waveform(Rectangle boundary, size_t m)
 {
     float mid_y = boundary.y + boundary.height / 2;
-    float saturation = 0.75f;
-    float value = 1.0f;
     float amp = boundary.height * 0.4f;
 
     for (size_t i = 0; i + 1 < m; ++i) {
         float t0 = p->out_smooth[i];
         float t1 = p->out_smooth[i + 1];
-        float hue = (float)i / m * 360;
-        Color color = ColorFromHSV(hue, saturation, value);
+        Color color = fft_colors[i];
         float x0 = boundary.x + (float)i / (m - 1) * boundary.width;
         float x1 = boundary.x + (float)(i + 1) / (m - 1) * boundary.width;
         float y0 = mid_y - t0 * amp;
@@ -540,8 +587,7 @@ static void fft_render_waveform(Rectangle boundary, size_t m)
     for (size_t i = 0; i + 1 < m; ++i) {
         float t0 = p->out_smooth[i];
         float t1 = p->out_smooth[i + 1];
-        float hue = (float)i / m * 360;
-        Color color = ColorFromHSV(hue, saturation, value * 0.5f);
+        Color color = fft_colors_dim[i];
         float x0 = boundary.x + (float)i / (m - 1) * boundary.width;
         float x1 = boundary.x + (float)(i + 1) / (m - 1) * boundary.width;
         float y0 = mid_y + t0 * amp * 0.5f;
@@ -568,15 +614,10 @@ static void fft_render(Rectangle boundary, size_t m)
     // The width of a single bar
     float cell_width = boundary.width/m;
 
-    // Global color parameters
-    float saturation = 0.75f;
-    float value = 1.0f;
-
     // Display the Bars
     for (size_t i = 0; i < m; ++i) {
         float t = p->out_smooth[i];
-        float hue = (float)i/m;
-        Color color = ColorFromHSV(hue*360, saturation, value);
+        Color color = fft_colors[i];
         Vector2 startPos = {
             boundary.x + i*cell_width + cell_width/2,
             boundary.y + boundary.height - boundary.height*2/3*t,
@@ -598,8 +639,7 @@ static void fft_render(Rectangle boundary, size_t m)
     for (size_t i = 0; i < m; ++i) {
         float start = p->out_smear[i];
         float end = p->out_smooth[i];
-        float hue = (float)i/m;
-        Color color = ColorFromHSV(hue*360, saturation, value);
+        Color color = fft_colors[i];
         Vector2 startPos = {
             boundary.x + i*cell_width + cell_width/2,
             boundary.y + boundary.height - boundary.height*2/3*start,
@@ -638,8 +678,7 @@ static void fft_render(Rectangle boundary, size_t m)
     BeginShaderMode(p->circle);
     for (size_t i = 0; i < m; ++i) {
         float t = p->out_smooth[i];
-        float hue = (float)i/m;
-        Color color = ColorFromHSV(hue*360, saturation, value);
+        Color color = fft_colors[i];
         Vector2 center = {
             boundary.x + i*cell_width + cell_width/2,
             boundary.y + boundary.height - boundary.height*2/3*t,
@@ -686,47 +725,73 @@ beat_flash:
     }
 }
 
-static void fft_push_frames(const float *samples, size_t frame_count, size_t channels)
+static bool fft_push_frames(const float *samples, size_t frame_count, size_t channels, bool wait)
 {
-    if (frame_count == 0) return;
+    if (frame_count == 0) return true;
     assert(samples == NULL || channels > 0);
 
-    platform_mutex_lock(fft_mutex);
-
-    size_t retained = frame_count < FFT_SIZE ? FFT_SIZE - frame_count : 0;
-    if (retained > 0) {
-        memmove(p->in_raw, p->in_raw + frame_count, retained*sizeof(p->in_raw[0]));
+    if (wait) {
+        platform_mutex_lock(fft_mutex);
+    } else if (!platform_mutex_try_lock(fft_mutex)) {
+        // Visualization data is best-effort. Never make the real-time audio
+        // thread wait for the UI thread to finish taking an FFT snapshot.
+        return false;
     }
 
-    size_t first_frame = frame_count > FFT_SIZE ? frame_count - FFT_SIZE : 0;
-    size_t output = retained;
-    for (size_t frame = first_frame; frame < frame_count; ++frame) {
-        p->in_raw[output++] = samples != NULL ? samples[frame*channels] : 0.0f;
+    if (frame_count >= FFT_SIZE) {
+        size_t first_frame = frame_count - FFT_SIZE;
+        if (samples == NULL) {
+            memset(p->in_raw, 0, sizeof(p->in_raw));
+        } else if (channels == 1) {
+            memcpy(p->in_raw, samples + first_frame, sizeof(p->in_raw));
+        } else {
+            for (size_t i = 0; i < FFT_SIZE; ++i) {
+                p->in_raw[i] = samples[(first_frame + i)*channels];
+            }
+        }
+        p->fft_write_cursor = 0;
+    } else {
+        size_t cursor = p->fft_write_cursor;
+        size_t first_count = FFT_SIZE - cursor;
+        if (first_count > frame_count) first_count = frame_count;
+        size_t second_count = frame_count - first_count;
+
+        if (samples == NULL) {
+            memset(p->in_raw + cursor, 0, first_count*sizeof(p->in_raw[0]));
+            memset(p->in_raw, 0, second_count*sizeof(p->in_raw[0]));
+        } else if (channels == 1) {
+            memcpy(p->in_raw + cursor, samples, first_count*sizeof(p->in_raw[0]));
+            memcpy(p->in_raw, samples + first_count, second_count*sizeof(p->in_raw[0]));
+        } else {
+            for (size_t i = 0; i < first_count; ++i) {
+                p->in_raw[cursor + i] = samples[i*channels];
+            }
+            for (size_t i = 0; i < second_count; ++i) {
+                p->in_raw[i] = samples[(first_count + i)*channels];
+            }
+        }
+
+        p->fft_write_cursor = (cursor + frame_count) & (FFT_SIZE - 1);
     }
 
     platform_mutex_unlock(fft_mutex);
+    return true;
 }
-
-#define EQ_LOW_FC 300.0f
-#define EQ_HIGH_FC 8000.0f
-#define EQ_SAMPLE_RATE 44100.0f
 
 static void apply_audio_eq(float (*buffer)[2], unsigned int frames)
 {
-    float alpha_low = 1.0f - expf(-2.0f * PI * EQ_LOW_FC / EQ_SAMPLE_RATE);
-    float alpha_high = 1.0f - expf(-2.0f * PI * EQ_HIGH_FC / EQ_SAMPLE_RATE);
+    float gain_low = p->eq_low * 2.0f;
+    float gain_mid = p->eq_mid * 2.0f;
+    float gain_high = p->eq_high * 2.0f;
 
     for (unsigned int i = 0; i < frames; ++i) {
         for (int ch = 0; ch < 2; ++ch) {
             float input = buffer[i][ch];
-            float gain_low = p->eq_low * 2.0f;
-            float gain_mid = p->eq_mid * 2.0f;
-            float gain_high = p->eq_high * 2.0f;
 
-            p->eq_low_lp[ch] += alpha_low * (input - p->eq_low_lp[ch]);
+            p->eq_low_lp[ch] += eq_alpha_low * (input - p->eq_low_lp[ch]);
             float low = p->eq_low_lp[ch];
 
-            p->eq_high_lp[ch] += alpha_high * (input - p->eq_high_lp[ch]);
+            p->eq_high_lp[ch] += eq_alpha_high * (input - p->eq_high_lp[ch]);
             float low_mid = p->eq_high_lp[ch];
 
             float mid = low_mid - low;
@@ -745,7 +810,7 @@ static void callback(void *bufferData, unsigned int frames)
 
     apply_audio_eq(fs, frames);
 
-    fft_push_frames((float *)fs, frames, 2);
+    (void)fft_push_frames((float *)fs, frames, 2, false);
 
 #ifdef MUSIALIZER_MICROPHONE
     if (p->capturing) {
@@ -906,15 +971,11 @@ static void tooltip(Rectangle boundary, const char *text, Side align, bool persi
 
 static void unload_preview_waveform(void)
 {
-    if (p->preview_wave_samples) {
-        UnloadWaveSamples(p->preview_wave_samples);
-        p->preview_wave_samples = NULL;
-    }
-    if (p->preview_wave.frameCount > 0) {
-        UnloadWave(p->preview_wave);
-        memset(&p->preview_wave, 0, sizeof(p->preview_wave));
-    }
-    p->prev_track_index = -1;
+    free(p->preview_waveform);
+    p->preview_waveform = NULL;
+    p->preview_waveform_count = 0;
+    free(p->preview_waveform_path);
+    p->preview_waveform_path = NULL;
 }
 
 #if defined(_WIN32)
@@ -1006,6 +1067,47 @@ static Wave load_wave_with_ffmpeg_fallback(const char *file_path)
     return wave;
 }
 
+static Waveform_Peak *create_waveform_cache(const char *file_path, size_t *peak_count_out)
+{
+    *peak_count_out = 0;
+    Wave wave = load_wave_with_ffmpeg_fallback(file_path);
+    if (wave.frameCount == 0 || wave.channels == 0) return NULL;
+
+    float *samples = LoadWaveSamples(wave);
+    if (samples == NULL) {
+        UnloadWave(wave);
+        return NULL;
+    }
+
+    size_t frame_count = wave.frameCount;
+    size_t channel_count = wave.channels;
+    size_t peak_count = frame_count < WAVEFORM_CACHE_BINS ? frame_count : WAVEFORM_CACHE_BINS;
+    Waveform_Peak *peaks = malloc(peak_count*sizeof(*peaks));
+    if (peaks != NULL) {
+        for (size_t i = 0; i < peak_count; ++i) {
+            size_t begin = i*frame_count/peak_count;
+            size_t end = (i + 1)*frame_count/peak_count;
+            float min_value = 0.0f;
+            float max_value = 0.0f;
+            for (size_t frame = begin; frame < end; ++frame) {
+                float value = 0.0f;
+                for (size_t channel = 0; channel < channel_count; ++channel) {
+                    value += samples[frame*channel_count + channel];
+                }
+                value /= (float)channel_count;
+                if (value < min_value) min_value = value;
+                if (value > max_value) max_value = value;
+            }
+            peaks[i] = (Waveform_Peak){ .min = min_value, .max = max_value };
+        }
+        *peak_count_out = peak_count;
+    }
+
+    UnloadWaveSamples(samples);
+    UnloadWave(wave);
+    return peaks;
+}
+
 static Image load_image_from_utf8_path(const char *file_path)
 {
     Image image = LoadImage(file_path);
@@ -1020,39 +1122,6 @@ static Image load_image_from_utf8_path(const char *file_path)
     image = LoadImageFromMemory(GetFileExtension(file_path), data, (int)size);
     free(data);
     return image;
-}
-
-static void load_preview_waveform(const char *file_path)
-{
-    unload_preview_waveform();
-    p->preview_wave = load_wave_from_utf8_path(file_path);
-
-    if (p->preview_wave.frameCount == 0) {
-        // FFmpeg fallback for unsupported formats
-        char wav_path[4096] = {0};
-        if (platform_make_temp_file(wav_path, sizeof(wav_path), "musializer", ".wav")) {
-            // Show loading indicator before blocking FFmpeg call
-            {
-                const char *msg = "Loading waveform...";
-                int fw = MeasureText(msg, 20);
-                DrawRectangle(0, GetScreenHeight()/2 - 15, GetScreenWidth(), 30, ColorAlpha(COLOR_BACKGROUND, 0.9f));
-                DrawText(msg, GetScreenWidth()/2 - fw/2, GetScreenHeight()/2 - 10, 20, WHITE);
-                EndDrawing();
-                BeginDrawing();
-                ClearBackground(COLOR_BACKGROUND);
-            }
-            if (convert_audio_with_ffmpeg(file_path, wav_path)) {
-                Wave wave = load_wave_from_utf8_path(wav_path);
-                if (wave.frameCount > 0) {
-                    p->preview_wave = wave;
-                    p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
-                }
-            }
-            platform_remove_file(wav_path);
-        }
-    } else {
-        p->preview_wave_samples = LoadWaveSamples(p->preview_wave);
-    }
 }
 
 static void play_track(int index)
@@ -1135,7 +1204,7 @@ static bool is_audio_extension(const char *ext)
 }
 
 // ----------------------------------------------------------------------------
-// Threaded loader for FFmpeg-based audio conversion and cover extraction
+// Threaded loader for FFmpeg conversion, cover extraction, and waveform caches
 // ----------------------------------------------------------------------------
 typedef struct {
     char source_path[4096];
@@ -1146,6 +1215,9 @@ typedef struct {
     int target_track; // -1 = create new track, >=0 = apply cover to existing track
     bool need_conversion;
     bool need_cover;
+    bool need_waveform;
+    Waveform_Peak *waveform;
+    size_t waveform_count;
 } Load_Job;
 
 static struct {
@@ -1178,6 +1250,12 @@ static void *loader_thread(void *arg)
         memmove(loader.pending, loader.pending + 1, (loader.pending_count - 1) * sizeof(Load_Job));
         loader.pending_count--;
         platform_mutex_unlock(loader.mutex);
+
+        if (job.need_waveform) {
+            job.waveform = create_waveform_cache(job.source_path, &job.waveform_count);
+            job.failed = job.waveform == NULL;
+            goto done;
+        }
 
         // Process: FFmpeg conversion
         if (job.need_conversion) {
@@ -1282,6 +1360,38 @@ static void enqueue_cover_job(const char *file_path, int track_index)
     platform_condition_signal(loader.condition);
 }
 
+static void enqueue_waveform_job(const char *file_path)
+{
+    if (!loader.running && !loader_init()) return;
+
+    Load_Job job = {0};
+    strncpy(job.source_path, file_path, sizeof(job.source_path) - 1);
+    job.need_waveform = true;
+
+    platform_mutex_lock(loader.mutex);
+    // Only the current track's preview matters. Drop stale queued previews and
+    // put this one ahead of cover-art work so it appears promptly.
+    for (size_t i = 0; i < loader.pending_count; ) {
+        if (loader.pending[i].need_waveform) {
+            memmove(loader.pending + i, loader.pending + i + 1,
+                (loader.pending_count - i - 1)*sizeof(*loader.pending));
+            loader.pending_count--;
+        } else {
+            i++;
+        }
+    }
+    if (loader.pending_count >= loader.pending_cap) {
+        loader.pending_cap = loader.pending_cap ? loader.pending_cap * 2 : 8;
+        loader.pending = realloc(loader.pending, loader.pending_cap * sizeof(Load_Job));
+        assert(loader.pending != NULL);
+    }
+    memmove(loader.pending + 1, loader.pending, loader.pending_count*sizeof(*loader.pending));
+    loader.pending[0] = job;
+    loader.pending_count++;
+    platform_mutex_unlock(loader.mutex);
+    platform_condition_signal(loader.condition);
+}
+
 static void process_completed_loads(void)
 {
     if (!loader.running) return;
@@ -1296,7 +1406,16 @@ static void process_completed_loads(void)
 
     for (size_t i = 0; i < n; i++) {
         Load_Job *job = &completed[i];
-        if (job->target_track >= 0) {
+        if (job->need_waveform) {
+            if (!job->failed && p->preview_waveform_path != NULL &&
+                strcmp(p->preview_waveform_path, job->source_path) == 0) {
+                free(p->preview_waveform);
+                p->preview_waveform = job->waveform;
+                p->preview_waveform_count = job->waveform_count;
+                job->waveform = NULL;
+            }
+            free(job->waveform);
+        } else if (job->target_track >= 0) {
             // Cover-only job: apply cover to existing track
             ptrdiff_t target_track = -1;
             if ((size_t)job->target_track < p->tracks.count &&
@@ -1372,10 +1491,12 @@ static void loader_stop(void)
     for (size_t i = 0; i < loader.pending_count; ++i) {
         platform_remove_file(loader.pending[i].wav_path);
         platform_remove_file(loader.pending[i].cover_path);
+        free(loader.pending[i].waveform);
     }
     for (size_t i = 0; i < loader.completed_count; ++i) {
         platform_remove_file(loader.completed[i].wav_path);
         platform_remove_file(loader.completed[i].cover_path);
+        free(loader.completed[i].waveform);
     }
     free(loader.pending);
     free(loader.completed);
@@ -1482,44 +1603,40 @@ static void timeline(Rectangle timeline_boundary, Track *track)
 {
     DrawRectangleRec(timeline_boundary, COLOR_TIMELINE_BACKGROUND);
 
-    // Lazy waveform loading
-    if (p->prev_track_index != p->current_track) {
+    // Decode and downsample the waveform on the loader thread. Decoding a long
+    // track here used to stall both rendering and calls to UpdateMusicStream().
+    if (p->preview_waveform_path == NULL || strcmp(p->preview_waveform_path, track->file_path) != 0) {
         unload_preview_waveform();
-        if (track) {
-            load_preview_waveform(track->file_path);
-        }
-        p->prev_track_index = p->current_track;
+        p->preview_waveform_path = duplicate_string(track->file_path);
+        if (p->preview_waveform_path != NULL) enqueue_waveform_job(track->file_path);
     }
 
-    // Draw waveform
-    if (p->preview_wave_samples && p->preview_wave.frameCount > 0) {
-        size_t total_frames = p->preview_wave.frameCount;
-        size_t channels = p->preview_wave.channels;
+    // Draw the fixed-size peak cache instead of rescanning every sample in the
+    // decoded track on every frame.
+    if (p->preview_waveform != NULL && p->preview_waveform_count > 0) {
+        size_t peak_count = p->preview_waveform_count;
+        int width = (int)timeline_boundary.width;
         float h = timeline_boundary.height;
         float mid_y = timeline_boundary.y + h / 2;
         Color wave_color = ColorAlpha(WHITE, 0.25);
 
-        for (int x = 0; x < (int)timeline_boundary.width; x++) {
-            size_t start = (size_t)((float)x / timeline_boundary.width * total_frames);
-            size_t end = (size_t)((float)(x + 1) / timeline_boundary.width * total_frames);
-            if (end > total_frames) end = total_frames;
-            if (start >= end) continue;
+        for (int x = 0; x < width; ++x) {
+            size_t start = (size_t)x*peak_count/(size_t)width;
+            size_t end = (size_t)(x + 1)*peak_count/(size_t)width;
+            if (start >= peak_count) continue;
+            if (end <= start) end = start + 1;
+            if (end > peak_count) end = peak_count;
 
             float min_val = 0.0f, max_val = 0.0f;
-            for (size_t f = start; f < end; f++) {
-                float sum = 0.0f;
-                for (size_t c = 0; c < channels; c++) {
-                    sum += p->preview_wave_samples[f * channels + c];
-                }
-                float val = sum / (float)channels;
-                if (val < min_val) min_val = val;
-                if (val > max_val) max_val = val;
+            for (size_t i = start; i < end; ++i) {
+                if (p->preview_waveform[i].min < min_val) min_val = p->preview_waveform[i].min;
+                if (p->preview_waveform[i].max > max_val) max_val = p->preview_waveform[i].max;
             }
 
             float y0 = mid_y - max_val * h / 2;
             float y1 = mid_y - min_val * h / 2;
             if (y0 > y1) { float tmp = y0; y0 = y1; y1 = tmp; }
-            DrawRectangle(x, (int)y0, 1, (int)(y1 - y0 + 1), wave_color);
+            DrawRectangle((int)timeline_boundary.x + x, (int)y0, 1, (int)(y1 - y0 + 1), wave_color);
         }
     }
 
@@ -3220,8 +3337,8 @@ static void rendering_screen(void)
                 const float *samples = available > 0
                     ? fs + p->wave_cursor*p->wave.channels
                     : NULL;
-                fft_push_frames(samples, available, p->wave.channels);
-                fft_push_frames(NULL, chunk_size - available, 1);
+                fft_push_frames(samples, available, p->wave.channels, true);
+                fft_push_frames(NULL, chunk_size - available, 1, true);
                 p->wave_cursor += chunk_size;
             }
 
@@ -3332,7 +3449,6 @@ MUSIALIZER_PLUG void plug_init(void)
     p->eq_low = 0.5f;
     p->eq_mid = 0.5f;
     p->eq_high = 0.5f;
-    p->prev_track_index = -1;
     p->crossfade_duration = 3.0f;
     p->track_was_playing = false;
     SetTargetFPS(PREVIEW_FPS);
